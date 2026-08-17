@@ -312,12 +312,12 @@ def _google_ai_overview_once(driver: webdriver.Chrome, name: str, city: str, sta
     return max(parts, key=len)[:12000] if parts else ""
 
 def google_ai_overview(driver: webdriver.Chrome, name: str, city: str, state: str, status: Any, captcha_wait_seconds: int) -> str:
-    """Retry the same clinic once when AI Mode never leaves its loading state."""
+    """Retry once when AI Mode is loading or explicitly has no answer."""
     for attempt in range(AI_MODE_MAX_ATTEMPTS):
         evidence = _google_ai_overview_once(driver, name, city, state, status, captcha_wait_seconds)
         if evidence: return evidence
         if attempt < AI_MODE_MAX_ATTEMPTS - 1:
-            status(f"{name}: AI Mode chưa trả lời sau 15 giây, đang chạy lại clinic này một lần…")
+            status(f"{name}: AI Mode chưa có câu trả lời hợp lệ, đang chạy lại clinic này một lần…")
     return ""
 
 def expand_ai_mode_answer(driver: webdriver.Chrome, main: Any) -> None:
@@ -353,10 +353,17 @@ def clean_ai_mode_evidence(text: str, query: str) -> str:
     return normalize_text(cleaned)
 
 def ai_mode_evidence_is_ready(evidence: str) -> bool:
-    """Reject Google AI Mode's temporary loading labels as non-evidence."""
+    """Reject temporary and explicit-no-answer AI Mode screens as non-evidence."""
     compact = normalize_text(evidence).lower().strip(" .…")
     pending = ("đang tìm kiếm", "searching", "đang suy nghĩ", "thinking", "generating")
-    return len(compact) >= 80 and compact not in pending
+    no_answer = (
+        "không có câu trả lời nào cho nội dung tìm kiếm này",
+        "hãy thử hỏi câu khác",
+        "no answer for this search",
+        "there are no answers for this search",
+        "try asking something else",
+    )
+    return len(compact) >= 80 and compact not in pending and not any(marker in compact for marker in no_answer)
 
 def wait_for_gemini_slot() -> None:
     """Share one conservative Gemini request cadence across all Chrome workers."""
