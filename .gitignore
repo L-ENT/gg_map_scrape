@@ -1,0 +1,20 @@
+# Python / packaged application output
+__pycache__/
+*.py[cod]
+venv/
+.packaging-venv/
+build/
+dist/
+*.spec
+
+# User data and local Streamlit settings
+checkpoints/
+.streamlit/secrets.toml
+*.xlsx
+*.csv
+
+# Editor / OS
+.vscode/
+.idea/
+node_modules/
+Thumbs.db

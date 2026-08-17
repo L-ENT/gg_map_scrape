@@ -1,0 +1,28 @@
+name: Build Windows app and publish update
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build portable Windows application
+        shell: pwsh
+        run: ./build_windows_app.ps1 -Version "build-${{ github.sha }}"
+      - name: Publish latest Windows package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: build-${{ github.sha }}
+        run: |
+          gh release create $env:TAG ./dist/Clinic-Lead-Collector-windows.zip --title "Clinic Lead Collector $env:TAG" --notes "Automatic build from commit $env:GITHUB_SHA" --latest
