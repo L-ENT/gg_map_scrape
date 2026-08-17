@@ -38,6 +38,10 @@ def main() -> None:
         "--server.headless", "true",
         "--server.fileWatcherType", "none",
         "--browser.gatherUsageStats", "false",
+        # A PyInstaller build must never inherit Streamlit's development mode:
+        # that mode conflicts with the fixed localhost port used by the desktop
+        # launcher and prevents the application from starting.
+        "--global.developmentMode", "false",
     ]
     stcli.main()
 
