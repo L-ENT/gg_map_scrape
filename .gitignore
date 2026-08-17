@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+venv/
+.packaging-venv/
+build/
+dist/
+*.spec
+checkpoints/
+.streamlit/secrets.toml
+*.xlsx
+*.csv
+.vscode/
+.idea/
+node_modules/
+Thumbs.db
