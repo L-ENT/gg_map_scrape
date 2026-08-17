@@ -8,11 +8,15 @@ $projectRoot = $PSScriptRoot
 $buildVenv = Join-Path $projectRoot '.packaging-venv'
 $pythonExe = Join-Path $buildVenv 'Scripts\python.exe'
 
-if (-not (Get-Command py -ErrorAction SilentlyContinue)) {
-    throw 'Python Launcher (py) was not found. Install Python 3.11 or newer from python.org, then run this script again.'
+if (Get-Command py -ErrorAction SilentlyContinue) {
+    & py -3.11 -m venv $buildVenv
+} elseif (Get-Command python -ErrorAction SilentlyContinue) {
+    # Some Windows setups have Python on PATH but do not install the `py`
+    # launcher. Any supported Python 3.11+ interpreter can build this app.
+    & python -m venv $buildVenv
+} else {
+    throw 'Python 3.11 or newer was not found. Install it from python.org, then run this script again.'
 }
-
-& py -3.11 -m venv $buildVenv
 & $pythonExe -m pip install --upgrade pip
 & $pythonExe -m pip install -r (Join-Path $projectRoot 'requirements.txt') pyinstaller
 
