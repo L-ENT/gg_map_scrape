@@ -8,6 +8,15 @@ $projectRoot = $PSScriptRoot
 $buildVenv = Join-Path $projectRoot '.packaging-venv'
 $pythonExe = Join-Path $buildVenv 'Scripts\python.exe'
 
+# A previous interrupted build can leave a venv pointing to a Python version
+# that has since been uninstalled. It is disposable packaging-only state.
+if (Test-Path $pythonExe) {
+    & $pythonExe --version 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item -LiteralPath $buildVenv -Recurse -Force
+    }
+}
+
 if (Get-Command py -ErrorAction SilentlyContinue) {
     & py -3.11 -m venv $buildVenv
 } elseif (Get-Command python -ErrorAction SilentlyContinue) {
