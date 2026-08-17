@@ -38,6 +38,7 @@ def main() -> None:
         "--server.headless", "true",
         "--server.fileWatcherType", "none",
         "--browser.gatherUsageStats", "false",
+        "--global.developmentMode", "false",
     ]
     stcli.main()
 
