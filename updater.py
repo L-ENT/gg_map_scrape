@@ -68,18 +68,13 @@ def main() -> int:
         launcher = target / "Clinic Lead Collector.exe"
         if not launcher.exists():
             raise RuntimeError("Không tìm thấy Clinic Lead Collector.exe sau cập nhật.")
-        # Windows keeps this updater executable locked while it runs. A detached
-        # batch file copies that last file after this process exits, then starts
-        # the newly installed main application.
-        script = workspace / "finish-update.cmd"
-        script.write_text(
-            "@echo off\r\n"
-            "timeout /t 2 /nobreak >nul\r\n"
-            f'copy /y "{package_root / "Clinic Lead Updater.exe"}" "{target / "Clinic Lead Updater.exe"}" >nul\r\n'
-            f'start "" "{launcher}"\r\n',
-            encoding="utf-8",
-        )
-        subprocess.Popen(["cmd", "/c", str(script)], cwd=str(target), close_fds=True)
+        # Keep the generic updater executable itself in place. Replacing a
+        # running .exe requires a shell script, and cmd.exe corrupts Unicode
+        # Windows paths (for example a user's Vietnamese name). The updater is
+        # deliberately small and backwards-compatible; it updates every app
+        # file, including version.txt and the main launcher, then starts it via
+        # the Unicode-safe Windows process API.
+        subprocess.Popen([str(launcher)], cwd=str(target), close_fds=True)
         return 0
     except Exception as exc:
         try:
@@ -89,10 +84,7 @@ def main() -> int:
             print(f"Update failed: {exc}", file=sys.stderr)
         return 1
     finally:
-        # On success the detached batch still reads this folder. Failed updates
-        # are cleaned up immediately.
-        if 'script' not in locals():
-            shutil.rmtree(workspace, ignore_errors=True)
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 if __name__ == "__main__":
