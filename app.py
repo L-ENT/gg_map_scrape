@@ -53,7 +53,6 @@ AI_MODE_PENDING_STABLE_SECONDS = 5.0
 AI_MODE_MIN_EVIDENCE_CHARS = 200
 AI_MODE_PENDING_MIN_EVIDENCE_CHARS = 500
 EXPORT_COLUMNS = ["Practice Name", "Website Link", "Phone Number", "Location (City Ne Only)", "Operation Time and Days", "Rating Star", "Owner"]
-TARGET_TERMS = ("counseling", "counsell", "therapy", "therapist", "mental health", "psychology", "psychologist", "wellness")
 RED_FLAG_TERMS = ("intensive outpatient", "substance abuse", "addiction treatment", "medical treatment", "peer support", "medication management", "case management", "psychiatric hospital")
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 UPDATE_REPOSITORY = "L-ENT/gg_map_scrape"
@@ -72,7 +71,7 @@ class Evidence:
     is_solo: bool = False; is_collective: bool = False; old_or_insufficient: bool = False
     over_25_years: bool = False; has_board: bool = False; nonprofit: bool = False
     private_practice: Optional[bool] = None; disallowed_provider_title: bool = False
-    red_flags: List[str] = field(default_factory=list); target_service: bool = False; ai_overview: str = ""
+    red_flags: List[str] = field(default_factory=list); target_service: bool = False
 
 def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
@@ -101,14 +100,8 @@ def clean_owner_name(value: str) -> str:
     if not all(re.fullmatch(r"[A-Za-zÀ-ÿ'’-]+", part) for part in parts): return "N/A"
     return value if all(part[0].isupper() for part in parts) else "N/A"
 
-def empty_evidence_from_ai_overview(ai_overview: str) -> Evidence:
-    """Gemini evaluates every keep/reject rule from the supplied evidence."""
-    return Evidence(ai_overview=ai_overview)
-
-def should_keep_in_final_output(row: Dict[str, Any], v: Dict[str, Any]) -> bool:
-    # Keep this public signature for existing callers; the row itself is not a
-    # selection signal. One shared decision prevents Debug from disagreeing
-    # with what is actually written to Excel.
+def should_keep_in_final_output(v: Dict[str, Any]) -> bool:
+    """Use the same decision text shown in Debug for the exported result."""
     return filter_result(v) == "KEEP"
 
 def filter_result(v: Dict[str, Any]) -> str:
@@ -579,10 +572,10 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                 debug.append({"Practice": row["Practice name"], "Keep": False, "Filter result": "RETRY: AI Mode chưa hoàn tất", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "", "Gemini": "not called", "Reasons": "AI Mode did not produce a complete stable answer after retries"})
                 continue
             overview = f"AI MODE (structured clinic screening query):\n{ai_mode_evidence}"
-            metadata = gemini_metadata(gemini_api_key, row, overview); e = merge_gemini_evidence(empty_evidence_from_ai_overview(overview), metadata); v = evidence_as_verification(e); row["Owner's name"] = e.owner
+            metadata = gemini_metadata(gemini_api_key, row, overview); e = merge_gemini_evidence(Evidence(), metadata); v = evidence_as_verification(e); row["Owner's name"] = e.owner
             gemini_hours = metadata.get("operation_time_and_days", "N/A")
             if metadata.get("status") == "ok" and gemini_hours != "N/A": row["operation time and days"] = gemini_hours
-            keep = should_keep_in_final_output(row, v)
+            keep = should_keep_in_final_output(v)
             debug.append({"Practice": row["Practice name"], "Keep": keep, "Filter result": filter_result(v), "Owner": e.owner, "Operation Time": row["operation time and days"], "Therapists": str(e.doctor_count) if e.doctor_count is not None else "UNKNOWN", "Private practice": "YES" if e.private_practice is True else ("NO" if e.private_practice is False else "UNKNOWN"), "Target services": "YES" if e.target_service is True else ("NO" if e.target_service is False else "UNKNOWN"), "AI Mode evidence": ai_mode_evidence, "Gemini": metadata.get("status"), "Reasons": "; ".join(e.red_flags) or "eligible / insufficient evidence", "_export_row": dict(row)})
             if not known_lock: known.add(key)
             if keep:
@@ -703,7 +696,7 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
     checkpoint_dir = checkpoint_directory()
     job: Dict[str, Any] = {
         **config, "lock": threading.Lock(), "stop_event": threading.Event(), "running": True,
-        "message": "Đang chuẩn bị…", "error": "", "finished": False,
+        "message": "Đang chuẩn bị…", "error": "",
         "known_lock": threading.Lock(), "captcha_workers": {},
         "rows_by_sheet": {sheet: [] for _, _, sheet in config["jobs"]}, "debug": [], "candidates": {},
         "checkpoint_path": str(checkpoint_dir / f"clinic_leads_checkpoint_{uuid.uuid4().hex[:8]}.xlsx"),
@@ -781,7 +774,7 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                 job["message"] = "Có lỗi, nhưng checkpoint đã được lưu."
         finally:
             with job["lock"]:
-                job["running"] = False; job["finished"] = True
+                job["running"] = False
     threading.Thread(target=worker, daemon=True, name="clinic-scraper").start()
     return job
 

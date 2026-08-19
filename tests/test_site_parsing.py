@@ -62,15 +62,14 @@ def test_incomplete_ai_mode_is_not_sent_to_gemini(monkeypatch):
 
 
 def test_keep_logic_and_debug_result_agree_for_matching_clinic():
-    row = {"Practice name": "Bright Path Counseling", "website link": "https://example.com", "phone number": "123"}
     verification = {"Is_NonProfit_StateOwned": False, "Contains_Red_Flags": False, "Has_Multiple_Therapists": True, "Contains_Target_Services_Licenses": True, "Owner's name": "N/A"}
-    assert should_keep_in_final_output(row, verification) is True
+    assert should_keep_in_final_output(verification) is True
     assert filter_result(verification) == "KEEP"
 
 
 def test_keep_logic_and_debug_result_agree_without_qualifying_evidence():
     verification = {"Is_NonProfit_StateOwned": False, "Contains_Red_Flags": False, "Has_Multiple_Therapists": False, "Contains_Target_Services_Licenses": False, "Owner's name": "N/A"}
-    assert should_keep_in_final_output({}, verification) is False
+    assert should_keep_in_final_output(verification) is False
     assert filter_result(verification) == "REJECT: insufficient qualifying evidence"
 
 
