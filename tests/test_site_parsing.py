@@ -5,10 +5,15 @@ from openpyxl import load_workbook
 
 from app import (
     EXPORT_COLUMNS,
+    AI_MODE_MIN_EVIDENCE_CHARS,
+    AI_MODE_PENDING_MIN_EVIDENCE_CHARS,
+    ai_mode_has_pending_marker,
+    ai_mode_evidence_is_ready,
     append_rows_preserving_template,
     extract_operation_time_from_text,
     filter_result,
     promote_updater_payload,
+    run_job,
     should_keep_in_final_output,
 )
 
@@ -16,6 +21,44 @@ from app import (
 def test_extract_operation_time_from_relevant_sentence():
     page_text = "Monday-Friday 9:00 AM - 5:00 PM. We offer counseling services."
     assert extract_operation_time_from_text(page_text) == "Monday-Friday 9:00 AM - 5:00 PM"
+
+
+def test_ai_mode_rejects_streaming_and_short_answers():
+    partial = "Đang tìm kiếm " + ("clinic information " * 10)
+    short_header = "Here is a brief, scannable overview of the clinic in Provo, Utah:"
+    assert len(partial) < AI_MODE_PENDING_MIN_EVIDENCE_CHARS
+    assert ai_mode_has_pending_marker(partial) is True
+    assert ai_mode_evidence_is_ready(partial) is False
+    assert ai_mode_evidence_is_ready(short_header) is False
+
+
+def test_ai_mode_accepts_complete_answer_without_pending_marker():
+    complete = "Owner Jane Doe. Private group counseling practice. " + ("Verified clinic details and services. " * 10)
+    assert len(complete) >= AI_MODE_MIN_EVIDENCE_CHARS
+    assert ai_mode_evidence_is_ready(complete) is True
+
+
+def test_incomplete_ai_mode_is_not_sent_to_gemini(monkeypatch):
+    row = {
+        "Practice name": "Incomplete Clinic",
+        "location": "Provo",
+        "operation time and days": "N/A",
+    }
+    monkeypatch.setattr("app.maps_search_urls", lambda *args, **kwargs: [("https://maps.test/place", "Incomplete Clinic")])
+    monkeypatch.setattr("app.extract_maps_place_with_retry", lambda *args, **kwargs: dict(row))
+    monkeypatch.setattr("app.google_ai_overview", lambda *args, **kwargs: "")
+
+    def unexpected_gemini_call(*args, **kwargs):
+        raise AssertionError("Gemini must not be called without complete AI Mode evidence")
+
+    monkeypatch.setattr("app.gemini_metadata", unexpected_gemini_call)
+    known = set()
+    accepted, debug = run_job(object(), "Provo", "UT", "therapy", 10, known, lambda message: None, "api-key")
+
+    assert accepted == []
+    assert debug[0]["Filter result"] == "RETRY: AI Mode chưa hoàn tất"
+    assert debug[0]["Gemini"] == "not called"
+    assert ("incomplete clinic", "provo") not in known
 
 
 def test_keep_logic_and_debug_result_agree_for_matching_clinic():

@@ -47,6 +47,11 @@ MAX_SAVED_CHECKPOINTS = 10
 GEMINI_MIN_REQUEST_INTERVAL_SECONDS = 5.0
 GEMINI_MAX_RETRIES = 4
 AI_MODE_MAX_ATTEMPTS = 2
+AI_MODE_WAIT_SECONDS = 30
+AI_MODE_STABLE_SECONDS = 2.0
+AI_MODE_PENDING_STABLE_SECONDS = 5.0
+AI_MODE_MIN_EVIDENCE_CHARS = 200
+AI_MODE_PENDING_MIN_EVIDENCE_CHARS = 500
 EXPORT_COLUMNS = ["Practice Name", "Website Link", "Phone Number", "Location (City Ne Only)", "Operation Time and Days", "Rating Star", "Owner"]
 TARGET_TERMS = ("counseling", "counsell", "therapy", "therapist", "mental health", "psychology", "psychologist", "wellness")
 RED_FLAG_TERMS = ("intensive outpatient", "substance abuse", "addiction treatment", "medical treatment", "peer support", "medication management", "case management", "psychiatric hospital")
@@ -276,32 +281,42 @@ def _google_ai_overview_once(driver: webdriver.Chrome, name: str, city: str, sta
     query = f'"{name}" {city} {state} briefly list owner, hours, private/nonprofit/government status, therapist count, locations, services including IOP, addiction, medication management, case management, peer support, medical treatment, solo/collective, board, 25+ years, MD/DO/PMHNP'
     driver.get(f"https://www.google.com/search?udm=50&q={quote_plus(query)}"); time.sleep(2.2); maybe_accept_google_consent(driver)
     if not wait_for_manual_captcha(driver, status, captcha_wait_seconds): return ""
-    # `udm=50` is Google Search's AI Mode surface.  Wait for an actual answer,
-    # not the temporary "Searching" / "Thinking" UI.
+    # `udm=50` is Google Search's AI Mode surface. Streaming answers can exceed
+    # the old 15-second timeout, and a partially rendered answer can already be
+    # longer than a sentence. Require the cleaned answer to stop changing for a
+    # few seconds; when streaming chrome remains visible, use a stricter minimum
+    # length and a longer stability window.
     try:
-        main = WebDriverWait(driver, 15).until(lambda d: d.find_element(By.CSS_SELECTOR, "div[role='main']"))
-        expand_ai_mode_answer(driver, main)
-        def completed_answer(d: webdriver.Chrome) -> Any:
-            main_text = normalize_text(d.find_element(By.CSS_SELECTOR, "div[role='main']").text)
-            evidence = clean_ai_mode_evidence(main_text, query)
-            return evidence[:12000] if ai_mode_evidence_is_ready(evidence) else False
-        return WebDriverWait(driver, 15).until(completed_answer)
+        main = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.CSS_SELECTOR, "div[role='main']"))
     except (TimeoutException, WebDriverException):
-        pass
-    parts: List[str] = []
-    for marker in ("AI Mode", "Chế độ AI", "AI Overview", "Thông tin tổng quan do AI tạo"):
-        for element in driver.find_elements(By.XPATH, f"//*[contains(normalize-space(), '{marker}')]"):
+        return ""
+    status(f"{name}: AI Mode đang tạo câu trả lời đầy đủ…")
+    deadline = time.monotonic() + AI_MODE_WAIT_SECONDS
+    last_evidence = ""
+    unchanged_since = time.monotonic()
+    last_expand_at = 0.0
+    while time.monotonic() < deadline:
+        try:
+            now = time.monotonic()
+            if now - last_expand_at >= 2.0:
+                expand_ai_mode_answer(driver, main)
+                last_expand_at = now
+            main_text = normalize_text(main.text)
+            evidence = clean_ai_mode_evidence(main_text, query)
+            if evidence != last_evidence:
+                last_evidence = evidence
+                unchanged_since = now
+            else:
+                required_stability = AI_MODE_PENDING_STABLE_SECONDS if ai_mode_has_pending_marker(evidence) else AI_MODE_STABLE_SECONDS
+                if ai_mode_evidence_is_ready(evidence) and now - unchanged_since >= required_stability:
+                    return evidence[:12000]
+        except (WebDriverException, StaleElementReferenceException):
             try:
-                # Only keep a compact nearby section; never fall back to body
-                # text, because that silently turns ordinary Search results into
-                # bogus AI Overview evidence.
-                for levels in ("ancestor::div[2]", "ancestor::div[3]"):
-                    text = normalize_text(element.find_element(By.XPATH, levels).text)
-                    if 80 <= len(text) <= 5000 and marker.lower() in text.lower():
-                        cleaned = clean_ai_mode_evidence(text, query)
-                        if ai_mode_evidence_is_ready(cleaned): parts.append(cleaned)
-            except (WebDriverException, StaleElementReferenceException): pass
-    return max(parts, key=len)[:12000] if parts else ""
+                main = driver.find_element(By.CSS_SELECTOR, "div[role='main']")
+            except WebDriverException:
+                return ""
+        time.sleep(0.5)
+    return ""
 
 def google_ai_overview(driver: webdriver.Chrome, name: str, city: str, state: str, status: Any, captcha_wait_seconds: int) -> str:
     """Retry once when AI Mode is loading or explicitly has no answer."""
@@ -347,7 +362,6 @@ def clean_ai_mode_evidence(text: str, query: str) -> str:
 def ai_mode_evidence_is_ready(evidence: str) -> bool:
     """Reject temporary and explicit-no-answer AI Mode screens as non-evidence."""
     compact = normalize_text(evidence).lower().strip(" .…")
-    pending = ("đang tìm kiếm", "searching", "đang suy nghĩ", "thinking", "generating")
     no_answer = (
         "không có câu trả lời nào cho nội dung tìm kiếm này",
         "hãy thử hỏi câu khác",
@@ -355,7 +369,17 @@ def ai_mode_evidence_is_ready(evidence: str) -> bool:
         "there are no answers for this search",
         "try asking something else",
     )
-    return len(compact) >= 80 and compact not in pending and not any(marker in compact for marker in no_answer)
+    minimum_length = AI_MODE_PENDING_MIN_EVIDENCE_CHARS if ai_mode_has_pending_marker(compact) else AI_MODE_MIN_EVIDENCE_CHARS
+    return (
+        len(compact) >= minimum_length
+        and not any(marker in compact for marker in no_answer)
+    )
+
+def ai_mode_has_pending_marker(evidence: str) -> bool:
+    """Detect Google streaming chrome, which may remain visible after completion."""
+    prefix = normalize_text(evidence).lower()[:200]
+    pending = ("đang tìm kiếm", "searching", "đang suy nghĩ", "thinking", "generating", "đang tạo", "loading")
+    return any(marker in prefix for marker in pending)
 
 def wait_for_gemini_slot() -> None:
     """Share one conservative Gemini request cadence across all Chrome workers."""
@@ -543,6 +567,17 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                 # Duplicate leads are deliberately skipped without cluttering Debug.
                 continue
             ai_mode_evidence = google_ai_overview(driver, row["Practice name"], city, state, progress, captcha_wait_seconds)
+            if not ai_mode_evidence:
+                # Never ask Gemini to decide from Maps alone when the required AI
+                # Mode evidence is missing or still streaming. Let another keyword
+                # encounter retry this clinic instead of permanently deduplicating it.
+                if known_lock:
+                    with known_lock:
+                        known.discard(key)
+                else:
+                    known.discard(key)
+                debug.append({"Practice": row["Practice name"], "Keep": False, "Filter result": "RETRY: AI Mode chưa hoàn tất", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "", "Gemini": "not called", "Reasons": "AI Mode did not produce a complete stable answer after retries"})
+                continue
             overview = f"AI MODE (structured clinic screening query):\n{ai_mode_evidence}"
             metadata = gemini_metadata(gemini_api_key, row, overview); e = merge_gemini_evidence(empty_evidence_from_ai_overview(overview), metadata); v = evidence_as_verification(e); row["Owner's name"] = e.owner
             gemini_hours = metadata.get("operation_time_and_days", "N/A")
