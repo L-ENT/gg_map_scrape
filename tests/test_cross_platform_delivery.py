@@ -1,6 +1,9 @@
 from pathlib import Path
+import socket
 
 import app
+import desktop_launcher
+import pytest
 import updater
 
 
@@ -72,3 +75,22 @@ def test_windows_archive_rejects_parent_path(tmp_path, monkeypatch):
         assert "không an toàn" in str(exc)
     else:
         raise AssertionError("Unsafe archive path was accepted")
+
+
+def test_updater_refuses_to_continue_when_parent_does_not_exit():
+    with pytest.raises(RuntimeError, match="chưa đóng hoàn toàn"):
+        updater.wait_for_parent(12345, seconds=0)
+
+
+def test_updater_refuses_to_continue_while_local_port_is_occupied():
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    try:
+        assert desktop_launcher.local_port_is_open(port) is True
+        with pytest.raises(RuntimeError, match="vẫn đang bị"):
+            updater.wait_for_port_release(port, seconds=0)
+    finally:
+        listener.close()
+    updater.wait_for_port_release(port, seconds=1)

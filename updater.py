@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,20 @@ def wait_for_parent(pid: int, seconds: int = 30) -> None:
         except OSError:
             return
         time.sleep(1)
+    raise RuntimeError("App cũ chưa đóng hoàn toàn sau 30 giây. Hãy đóng Clinic Lead Collector trong Task Manager rồi cập nhật lại.")
+
+
+def wait_for_port_release(port: int, seconds: int = 15) -> None:
+    """Do not install over a stale Streamlit process that still owns the port."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                pass
+        except OSError:
+            return
+        time.sleep(0.5)
+    raise RuntimeError(f"Localhost port {port} vẫn đang bị phiên app cũ sử dụng. Hãy đóng app trong Task Manager rồi cập nhật lại.")
 
 
 def extract_archive(archive: Path, destination: Path) -> None:
@@ -112,6 +127,7 @@ def main() -> int:
         if not package_root.is_dir():
             raise RuntimeError(f"Gói cập nhật không có {package_name}.")
         wait_for_parent(args.parent_pid)
+        wait_for_port_release(8501)
         if sys.platform == "darwin":
             replace_macos_application(package_root, target)
             return 0
