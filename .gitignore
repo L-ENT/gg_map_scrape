@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 venv/
 .packaging-venv/
+.packaging-venv-macos/
 build/
 dist/
 *.spec

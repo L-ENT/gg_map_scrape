@@ -6,6 +6,7 @@ public GitHub Release asset URL after the person has clicked the update button.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -23,15 +24,42 @@ def wait_for_parent(pid: int, seconds: int = 30) -> None:
     deadline = time.time() + seconds
     while time.time() < deadline:
         try:
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
-            )
-            if str(pid) not in result.stdout:
-                return
+            if sys.platform == "win32":
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
+                )
+                if str(pid) not in result.stdout:
+                    return
+            else:
+                os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            # The process exists but macOS will not let us signal it.
+            pass
         except OSError:
             return
         time.sleep(1)
+
+
+def extract_archive(archive: Path, destination: Path) -> None:
+    """Extract a release without allowing paths to escape the workspace."""
+    destination.mkdir(parents=True, exist_ok=True)
+    destination_root = destination.resolve()
+    with zipfile.ZipFile(archive) as zip_file:
+        for member in zip_file.infolist():
+            member_path = (destination / member.filename).resolve()
+            try:
+                member_path.relative_to(destination_root)
+            except ValueError as exc:
+                raise RuntimeError("Gói cập nhật chứa đường dẫn không an toàn.") from exc
+    if sys.platform == "darwin":
+        # ditto preserves executable modes, symlinks and macOS bundle metadata.
+        subprocess.run(["/usr/bin/ditto", "-x", "-k", str(archive), str(destination)], check=True)
+        return
+    with zipfile.ZipFile(archive) as zip_file:
+        zip_file.extractall(destination)
 
 
 def replace_installation(source: Path, target: Path) -> None:
@@ -47,6 +75,25 @@ def replace_installation(source: Path, target: Path) -> None:
             shutil.copy2(item, destination)
 
 
+def replace_macos_application(source: Path, target: Path) -> None:
+    """Replace one .app bundle with rollback if installation fails."""
+    if target.suffix.casefold() != ".app":
+        raise RuntimeError("Thư mục cài đặt macOS không phải là file .app.")
+    backup = target.with_name(f"{target.name}.previous")
+    if backup.exists():
+        shutil.rmtree(backup)
+    target.rename(backup)
+    try:
+        shutil.move(str(source), str(target))
+    except Exception:
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        backup.rename(target)
+        raise
+    subprocess.Popen(["/usr/bin/open", str(target)], close_fds=True)
+    shutil.rmtree(backup, ignore_errors=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Install Clinic Lead Collector update")
     parser.add_argument("--target", required=True)
@@ -58,28 +105,34 @@ def main() -> int:
     try:
         archive = workspace / "update.zip"
         urlretrieve(args.url, archive)
-        with zipfile.ZipFile(archive) as zip_file:
-            zip_file.extractall(workspace / "unzipped")
-        package_root = workspace / "unzipped" / "Clinic Lead Collector"
+        extracted = workspace / "unzipped"
+        extract_archive(archive, extracted)
+        package_name = "Clinic Lead Collector.app" if sys.platform == "darwin" else "Clinic Lead Collector"
+        package_root = extracted / package_name
         if not package_root.is_dir():
-            raise RuntimeError("Gói cập nhật không có thư mục Clinic Lead Collector.")
+            raise RuntimeError(f"Gói cập nhật không có {package_name}.")
         wait_for_parent(args.parent_pid)
+        if sys.platform == "darwin":
+            replace_macos_application(package_root, target)
+            return 0
         replace_installation(package_root, target)
         launcher = target / "Clinic Lead Collector.exe"
         if not launcher.exists():
             raise RuntimeError("Không tìm thấy Clinic Lead Collector.exe sau cập nhật.")
-        # Keep the generic updater executable itself in place. Replacing a
-        # running .exe requires a shell script, and cmd.exe corrupts Unicode
-        # Windows paths (for example a user's Vietnamese name). The updater is
-        # deliberately small and backwards-compatible; it updates every app
-        # file, including version.txt and the main launcher, then starts it via
-        # the Unicode-safe Windows process API.
+        # Keep the running updater executable in place. The package also
+        # contains "Clinic Lead Updater Payload.exe", which is copied above;
+        # after this process exits, the restarted main app promotes that payload
+        # over the old updater using the Unicode-safe Windows process API.
         subprocess.Popen([str(launcher)], cwd=str(target), close_fds=True)
         return 0
     except Exception as exc:
         try:
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(0, f"Cập nhật không thành công:\n{exc}", "Clinic Lead Collector", 0x10)
+            if sys.platform == "darwin":
+                script = 'on run argv\ndisplay alert "Clinic Lead Collector" message (item 1 of argv) as critical\nend run'
+                subprocess.run(["/usr/bin/osascript", "-e", script, "--", f"Cập nhật không thành công:\n{exc}"], check=False)
+            else:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(0, f"Cập nhật không thành công:\n{exc}", "Clinic Lead Collector", 0x10)
         except Exception:
             print(f"Update failed: {exc}", file=sys.stderr)
         return 1

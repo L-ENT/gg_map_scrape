@@ -46,6 +46,9 @@ if (Get-Command py -ErrorAction SilentlyContinue) {
 
 $appFolder = Join-Path $projectRoot 'dist\Clinic Lead Collector'
 Copy-Item (Join-Path $projectRoot 'dist\Clinic Lead Updater.exe') (Join-Path $appFolder 'Clinic Lead Updater.exe') -Force
+# Keep a second, differently named copy so an already-installed legacy updater
+# can deliver its own replacement. The main app promotes this payload on launch.
+Copy-Item (Join-Path $projectRoot 'dist\Clinic Lead Updater.exe') (Join-Path $appFolder 'Clinic Lead Updater Payload.exe') -Force
 Set-Content -Path (Join-Path $appFolder 'version.txt') -Value $Version -NoNewline -Encoding utf8
 
 $zipPath = Join-Path $projectRoot 'dist\Clinic-Lead-Collector-windows.zip'

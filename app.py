@@ -52,7 +52,10 @@ TARGET_TERMS = ("counseling", "counsell", "therapy", "therapist", "mental health
 RED_FLAG_TERMS = ("intensive outpatient", "substance abuse", "addiction treatment", "medical treatment", "peer support", "medication management", "case management", "psychiatric hospital")
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 UPDATE_REPOSITORY = "L-ENT/gg_map_scrape"
-UPDATE_ASSET_NAME = "Clinic-Lead-Collector-windows.zip"
+UPDATE_ASSET_NAMES = {
+    "win32": "Clinic-Lead-Collector-windows.zip",
+    "darwin": "Clinic-Lead-Collector-macos-arm64.zip",
+}
 _GEMINI_CACHE: Dict[str, Dict[str, Any]] = {}
 _GEMINI_CACHE_LOCK = threading.Lock()
 _GEMINI_RATE_LOCK = threading.Lock()
@@ -93,33 +96,15 @@ def clean_owner_name(value: str) -> str:
     if not all(re.fullmatch(r"[A-Za-zÀ-ÿ'’-]+", part) for part in parts): return "N/A"
     return value if all(part[0].isupper() for part in parts) else "N/A"
 
-def extract_owner_name_from_text(text: str) -> str:
-    name = r"([A-Z][A-Za-zÀ-ÿ.'’-]+(?:\s+[A-Z][A-Za-zÀ-ÿ.'’-]+){1,4})"
-    for pat in (rf"\b(?:founder|co-founder|owner|clinical director|CEO)\s*(?:is|:|,|-)?\s*{name}", rf"{name}\s*(?:,|-|is )\s*(?:the )?(?:founder|co-founder|owner|clinical director|CEO)\b", rf"\bfounded by\s+{name}"):
-        match = re.search(pat, text, re.I)
-        if match: return clean_owner_name(match.group(1))
-    return "N/A"
-
-def extract_owner_and_time_from_pages(page_infos: List[Dict[str, Any]], api_key: str = "") -> Dict[str, str]:
-    """Legacy pure helper retained for callers/tests; it performs no network work."""
-    text = "\n".join(str(page.get("text", "")) for page in page_infos)
-    return {"Owner's name": extract_owner_name_from_text(text), "operation time and days": extract_operation_time_from_text(text)}
-
-def _number_before(text: str, nouns: str) -> Optional[int]:
-    match = re.search(rf"\b(\d{{1,3}})\+?\s+(?:{nouns})\b", text, re.I)
-    return int(match.group(1)) if match else None
-
 def empty_evidence_from_ai_overview(ai_overview: str) -> Evidence:
     """Gemini evaluates every keep/reject rule from the supplied evidence."""
     return Evidence(ai_overview=ai_overview)
 
 def should_keep_in_final_output(row: Dict[str, Any], v: Dict[str, Any]) -> bool:
-    if v.get("Is_NonProfit_StateOwned") or v.get("Contains_Red_Flags") or v.get("Contains_Disallowed_Provider_Title"): return False
-    if v.get("is_private_practice") is False: return False
-    if any(v.get(k) is True for k in ("is_solo_practitioner", "seems_outdated_or_insufficient_website", "mentions_25_plus_years_experience", "is_therapist_collective_or_independent", "has_board_of_directors")): return False
-    if isinstance(v.get("doctor_count"), (int, float)) and v["doctor_count"] >= MAX_DOCTOR_COUNT: return False
-    if isinstance(v.get("branch_count"), (int, float)) and v["branch_count"] > MAX_BRANCH_COUNT: return False
-    return bool(v.get("Contains_Target_Services_Licenses") or v.get("Has_Multiple_Therapists") or v.get("Owner's name", "N/A") != "N/A")
+    # Keep this public signature for existing callers; the row itself is not a
+    # selection signal. One shared decision prevents Debug from disagreeing
+    # with what is actually written to Excel.
+    return filter_result(v) == "KEEP"
 
 def filter_result(v: Dict[str, Any]) -> str:
     """Human-readable reason shown in Debug for every accepted/rejected lead."""
@@ -131,7 +116,14 @@ def filter_result(v: Dict[str, Any]) -> str:
         elif v.get(key) is True: reasons.append(label)
     if isinstance(v.get("doctor_count"), (int, float)) and v["doctor_count"] >= MAX_DOCTOR_COUNT: reasons.append(f"{MAX_DOCTOR_COUNT}+ therapists")
     if isinstance(v.get("branch_count"), (int, float)) and v["branch_count"] > MAX_BRANCH_COUNT: reasons.append(f">{MAX_BRANCH_COUNT} locations")
-    return "KEEP" if not reasons else "REJECT: " + "; ".join(reasons)
+    if reasons:
+        return "REJECT: " + "; ".join(reasons)
+    has_qualifying_evidence = bool(
+        v.get("Contains_Target_Services_Licenses")
+        or v.get("Has_Multiple_Therapists")
+        or v.get("Owner's name", "N/A") != "N/A"
+    )
+    return "KEEP" if has_qualifying_evidence else "REJECT: insufficient qualifying evidence"
 
 def evidence_as_verification(e: Evidence) -> Dict[str, Any]:
     return {"Owner's name": e.owner, "doctor_count": e.doctor_count, "branch_count": e.branch_count, "Is_NonProfit_StateOwned": e.nonprofit, "is_private_practice": e.private_practice, "Contains_Red_Flags": bool(e.red_flags), "Contains_Disallowed_Provider_Title": e.disallowed_provider_title, "is_solo_practitioner": e.is_solo, "seems_outdated_or_insufficient_website": e.old_or_insufficient, "mentions_25_plus_years_experience": e.over_25_years, "is_therapist_collective_or_independent": e.is_collective, "has_board_of_directors": e.has_board, "Contains_Target_Services_Licenses": e.target_service, "Has_Multiple_Therapists": bool(e.doctor_count and e.doctor_count > 1)}
@@ -499,11 +491,25 @@ def append_rows_preserving_template(template: bytes, rows_by_sheet: Dict[str, pd
     for wanted, rows in rows_by_sheet.items():
         if rows.empty: continue
         ws = workbook[wanted] if wanted in workbook.sheetnames else workbook.create_sheet(wanted)
-        headers = [normalize_text(ws.cell(1, c).value) for c in range(1, ws.max_column + 1)]
-        if not all(h in headers for h in EXPORT_COLUMNS):
-            ws.delete_rows(1, ws.max_row); headers = EXPORT_COLUMNS
-            for c, h in enumerate(headers, 1): ws.cell(1, c, h).font = Font(name="Arial", bold=True)
-        locations = {h: headers.index(h) + 1 for h in EXPORT_COLUMNS}
+        # Preserve every existing row and column. Sheet discovery is deliberately
+        # lenient, so an older workbook may have only some export columns or use
+        # different capitalization. Add only missing columns instead of replacing
+        # the sheet, which would destroy the user's existing leads.
+        existing_locations: Dict[str, int] = {}
+        for column in range(1, ws.max_column + 1):
+            header = normalize_text(ws.cell(1, column).value)
+            if header:
+                existing_locations.setdefault(header.casefold(), column)
+        next_column = 1 if not existing_locations and ws.cell(1, 1).value is None else ws.max_column + 1
+        locations: Dict[str, int] = {}
+        for header in EXPORT_COLUMNS:
+            column = existing_locations.get(header.casefold())
+            if column is None:
+                column = next_column
+                next_column += 1
+                ws.cell(1, column, header).font = Font(name="Arial", bold=True)
+                existing_locations[header.casefold()] = column
+            locations[header] = column
         added_row_fill = PatternFill(fill_type="solid", fgColor="FFF2CC")
         for record in rows.to_dict("records"):
             n = ws.max_row + 1
@@ -562,8 +568,11 @@ def save_checkpoint_locked(job: Dict[str, Any]) -> None:
     job["checkpoint_bytes"] = output
 
 def checkpoint_directory() -> Path:
-    """A writable persistent location for the packaged Windows application."""
-    base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ClinicLeadCollector" / "checkpoints"
+    """Return a writable persistent checkpoint location for this platform."""
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "ClinicLeadCollector" / "checkpoints"
+    else:
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ClinicLeadCollector" / "checkpoints"
     base.mkdir(parents=True, exist_ok=True)
     checkpoints = sorted(base.glob("clinic_leads_checkpoint_*.xlsx"), key=lambda path: path.stat().st_mtime, reverse=True)
     for old_file in checkpoints[MAX_SAVED_CHECKPOINTS:]:
@@ -572,20 +581,64 @@ def checkpoint_directory() -> Path:
     return base
 
 def installed_app_directory() -> Path:
-    return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).resolve().parent
+    executable = Path(sys.executable).resolve()
+    if sys.platform == "darwin":
+        for parent in executable.parents:
+            if parent.suffix.casefold() == ".app":
+                return parent
+    return executable.parent
+
+def installed_app_version_path() -> Path:
+    app_directory = installed_app_directory()
+    if sys.platform == "darwin" and app_directory.suffix.casefold() == ".app":
+        return app_directory / "Contents" / "Resources" / "version.txt"
+    return app_directory / "version.txt"
 
 def installed_app_version() -> str:
-    try: return (installed_app_directory() / "version.txt").read_text(encoding="utf-8").strip() or "dev"
+    try: return installed_app_version_path().read_text(encoding="utf-8-sig").strip() or "dev"
     except OSError: return "dev"
+
+def updater_executable() -> Path:
+    app_directory = installed_app_directory()
+    if sys.platform == "darwin":
+        return app_directory / "Contents" / "Resources" / "Clinic Lead Updater"
+    return app_directory / "Clinic Lead Updater.exe"
+
+def promote_updater_payload() -> None:
+    """Install the updater shipped as a sidecar while the updater is not running.
+
+    Older updater builds deliberately skip their own executable. They do copy
+    this differently named payload, allowing the newly restarted main app to
+    promote it and keeping the updater itself upgradeable.
+    """
+    if not getattr(sys, "frozen", False) or sys.platform != "win32": return
+    app_directory = installed_app_directory()
+    payload = app_directory / "Clinic Lead Updater Payload.exe"
+    updater = app_directory / "Clinic Lead Updater.exe"
+    if not payload.exists(): return
+    # The previous updater launches this app just before its own process exits,
+    # so Windows may keep the old executable locked for a brief moment.
+    for _ in range(20):
+        try:
+            os.replace(payload, updater)
+            return
+        except OSError:
+            time.sleep(0.1)
+    # A failed promotion must not prevent the collector from starting. The
+    # payload stays in place so the next launch can retry.
 
 def available_release() -> Optional[Dict[str, str]]:
     """Read the public GitHub Release metadata; never send user/API data."""
+    asset_name = UPDATE_ASSET_NAMES.get(sys.platform)
+    if not asset_name: return None
     try:
         response = requests.get(f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest", timeout=6)
         if response.status_code != 200: return None
         release = response.json(); tag = normalize_text(release.get("tag_name", ""))
         for asset in release.get("assets", []):
-            if asset.get("name") == UPDATE_ASSET_NAME:
+            if asset.get("name") == asset_name:
                 return {"version": tag, "url": normalize_text(asset.get("browser_download_url", ""))}
     except (requests.RequestException, ValueError, AttributeError):
         pass
@@ -598,7 +651,7 @@ def render_update_control() -> None:
     if not release or not release["url"] or release["version"] == current: return
     st.sidebar.info(f"Có bản cập nhật mới: {release['version']} (đang dùng {current})")
     if st.sidebar.button("Cập nhật app và khởi động lại", type="primary"):
-        updater = installed_app_directory() / "Clinic Lead Updater.exe"
+        updater = updater_executable()
         if not updater.exists():
             st.sidebar.error("Không tìm thấy updater trong thư mục app.")
             return
@@ -789,6 +842,7 @@ def show_background_job(job: Dict[str, Any]) -> None:
 
 def main() -> None:
     st.title("Google Maps + AI Overview clinic lead collector")
+    promote_updater_payload()
     render_update_control()
     active_job = st.session_state.get("scrape_job")
     if active_job:

@@ -1,4 +1,4 @@
-"""Windows desktop launcher for the local Streamlit clinic collector."""
+"""Cross-platform desktop launcher for the local Streamlit clinic collector."""
 import os
 import sys
 import threading

@@ -1,4 +1,4 @@
-name: Build Windows app and publish update
+name: Test, build desktop apps and publish update
 
 on:
   push:
@@ -9,7 +9,20 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Run tests
+        run: python -m pytest -q
+
+  build-windows:
+    needs: test
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,10 +32,47 @@ jobs:
       - name: Build portable Windows application
         shell: pwsh
         run: ./build_windows_app.ps1 -Version "build-${{ github.sha }}"
-      - name: Publish latest Windows package
-        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: dist/Clinic-Lead-Collector-windows.zip
+          if-no-files-found: error
+
+  build-macos-arm64:
+    needs: test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: arm64
+      - name: Build Apple Silicon application
+        shell: bash
+        run: bash ./build_macos_app.sh "build-${{ github.sha }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-package
+          path: dist/Clinic-Lead-Collector-macos-arm64.zip
+          if-no-files-found: error
+
+  release:
+    needs: [build-windows, build-macos-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-package'
+          path: dist
+          merge-multiple: true
+      - name: Publish Windows and macOS packages
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: build-${{ github.sha }}
         run: |
-          gh release create $env:TAG ./dist/Clinic-Lead-Collector-windows.zip --title "Clinic Lead Collector $env:TAG" --notes "Automatic build from commit $env:GITHUB_SHA" --latest
+          gh release create "$TAG" \
+            ./dist/Clinic-Lead-Collector-windows.zip \
+            ./dist/Clinic-Lead-Collector-macos-arm64.zip \
+            --title "Clinic Lead Collector $TAG" \
+            --notes "Automatic Windows and Apple Silicon build from commit $GITHUB_SHA" \
+            --latest
