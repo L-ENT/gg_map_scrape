@@ -73,6 +73,7 @@ jobs:
           gh release create "$TAG" \
             ./dist/Clinic-Lead-Collector-windows.zip \
             ./dist/Clinic-Lead-Collector-macos-arm64.zip \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Clinic Lead Collector $TAG" \
             --notes "Automatic Windows and Apple Silicon build from commit $GITHUB_SHA" \
             --latest
