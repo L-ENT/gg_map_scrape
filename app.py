@@ -869,7 +869,8 @@ def show_background_job(job: Dict[str, Any]) -> None:
         _render_background_job(job)
 
 def main() -> None:
-    st.title("Google Maps + AI Overview clinic lead collector")
+    st.title("🏥 Tìm kiếm phòng khám")
+    st.caption("Tìm trên Google Maps, kiểm tra bằng AI Mode và lưu kết quả vào Excel.")
     promote_updater_payload()
     render_update_control()
     active_job = st.session_state.get("scrape_job")
@@ -881,33 +882,69 @@ def main() -> None:
         with stopping_job["lock"]:
             still_stopping = stopping_job["running"]
         if still_stopping:
-            st.info("Lượt trước đang dừng và lưu checkpoint ở nền. Bạn vẫn có thể cấu hình lượt tiếp theo; checkpoint gần nhất ở bên dưới.")
+            st.info("Lượt trước đang dừng và lưu kết quả tạm thời. Bạn vẫn có thể chuẩn bị lượt tiếp theo.")
         else:
             st.session_state.pop("stopping_scrape_job", None)
     checkpoint_dir = checkpoint_directory()
     old_checkpoints = sorted(checkpoint_dir.glob("clinic_leads_checkpoint_*.xlsx"), key=lambda path: path.stat().st_mtime, reverse=True) if checkpoint_dir.exists() else []
     if old_checkpoints:
         latest = old_checkpoints[0]
-        st.download_button("Tải checkpoint từ lượt chạy trước", data=latest.read_bytes(), file_name="clinic_leads_recovered.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    upload = st.file_uploader("Excel mẫu / workbook đang dùng (tuỳ chọn)", type=["xlsx"]); city = st.text_input("Manual City (tuỳ chọn — ngăn cách nhiều city bằng dấu phẩy)", "", help="Ví dụ: Provo, Orem, Sandy. Tất cả city này dùng cùng State ở ô bên cạnh."); state = st.text_input("State dùng cho sheet chỉ có tên City", "UT")
-    keywords = st.text_area("Keywords — mỗi dòng một từ khoá", "counseling center\nmental health clinic\ntherapy practice")
-    limit = st.number_input("Tối đa lead Maps / keyword", 1, 200, 100)
-    captcha_wait_seconds = st.number_input("Thời gian chờ bạn xác minh CAPTCHA (giây)", min_value=30, max_value=900, value=300, step=30)
-    captcha_notifications = st.checkbox("Thông báo khi CAPTCHA xuất hiện", value=True)
-    gemini_api_key = st.text_input("Gemini API key (Gemini 3.5 Flash-Lite — bắt buộc)", type="password", help="Bắt buộc để Gemini đánh giá điều kiện lead từ Maps/AI Mode, chuẩn hoá Owner và Operation Time. Key chỉ dùng trong lượt chạy này.")
+        st.download_button("Khôi phục kết quả tạm từ lượt trước", data=latest.read_bytes(), file_name="clinic_leads_recovered.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", help="Dùng khi lượt chạy trước bị tắt giữa chừng.")
+
+    st.subheader("1. Dữ liệu cũ")
+    upload = st.file_uploader(
+        "Tải file Excel đang dùng",
+        type=["xlsx"],
+        help="App giữ nguyên dữ liệu cũ, tránh lặp lại lead đã có và thêm kết quả mới vào file. Không có file cũ thì bỏ qua bước này.",
+    )
+
+    st.subheader("2. Khu vực cần tìm")
+    city_col, state_col = st.columns([2, 1])
+    with city_col:
+        city = st.text_input(
+            "Thành phố",
+            "",
+            placeholder="Ví dụ: Provo, Orem, Sandy",
+            help="Có thể nhập nhiều thành phố, ngăn cách bằng dấu phẩy.",
+        )
+    with state_col:
+        state = st.text_input(
+            "Bang",
+            "",
+            placeholder="Ví dụ: UT",
+            help="Bang dùng cho các thành phố vừa nhập và sheet chỉ có tên thành phố. Ví dụ: UT = Utah, CA = California. Nếu sheet đã có dạng 'Provo, UT' thì app tự nhận bang.",
+        )
+
+    st.subheader("3. Kết nối Gemini")
+    gemini_api_key = st.text_input(
+        "Gemini API key",
+        type="password",
+        placeholder="Dán API key vào đây",
+        help="Bắt buộc để AI kiểm tra và chuẩn hoá thông tin. Key chỉ được dùng trong lượt chạy này.",
+    )
+
+    with st.expander("⚙️ Cài đặt nâng cao", expanded=False):
+        st.caption("Các giá trị mặc định đã phù hợp cho hầu hết trường hợp.")
+        keywords = st.text_area("Từ khoá tìm kiếm (mỗi dòng một từ khoá)", "counseling center\nmental health clinic\ntherapy practice")
+        limit = st.number_input("Số kết quả tối đa cho mỗi từ khoá", 1, 200, 100)
+        captcha_wait_seconds = st.number_input("Thời gian chờ xác minh CAPTCHA (giây)", min_value=30, max_value=900, value=300, step=30, help="Khi Google yêu cầu xác minh, app sẽ chờ bạn giải CAPTCHA trong khoảng thời gian này.")
+        captcha_notifications = st.checkbox("Thông báo khi cần xác minh CAPTCHA", value=True)
     source = upload.getvalue() if upload else b""
     detected = discover_city_sheets(source, state) if source else []
     selected_sheets: List[str] = []
     if detected:
         sheet_to_label = {item["sheet_name"]: f"{item['sheet_name']}  →  {item['city']}, {item['state'] or 'state chưa rõ'}" for item in detected}
-        selected_sheets = st.multiselect("Chạy tiếp các city sheet này", options=list(sheet_to_label), default=list(sheet_to_label), format_func=lambda name: sheet_to_label[name])
-        st.success(f"Đã nhận {len(detected)} sheet lead. Dữ liệu cũ và các sheet khác sẽ được giữ nguyên.")
+        selected_sheets = st.multiselect("Các sheet sẽ tiếp tục tìm", options=list(sheet_to_label), default=list(sheet_to_label), format_func=lambda name: sheet_to_label[name])
+        st.success(f"Đã nhận {len(detected)} sheet có dữ liệu lead. Dữ liệu cũ và các sheet khác sẽ được giữ nguyên.")
     elif upload:
-        st.warning("Không nhận được sheet lead (cần có cột Practice Name và Phone Number). Bạn vẫn có thể chạy Manual City.")
-    run_manual = st.checkbox("Chạy thêm Manual City", value=not bool(detected))
-    if not st.button("Start Google Maps + AI Overview"): return
+        st.warning("File chưa có sheet lead hợp lệ (cần cột Practice Name và Phone Number). Bạn vẫn có thể tìm theo thành phố đã nhập.")
+    run_manual = bool(city.strip())
+    if detected and city.strip():
+        st.info("App sẽ tìm cả các sheet đã chọn và các thành phố bạn vừa nhập.")
+    st.subheader("4. Bắt đầu")
+    if not st.button("🔍 BẮT ĐẦU TÌM KIẾM", type="primary", use_container_width=True): return
     if not keywords.strip(): st.error("Nhập ít nhất một keyword."); return
-    if not gemini_api_key.strip(): st.error("Nhập Gemini API key trước khi chạy; toàn bộ rule lead hiện do Gemini đánh giá."); return
+    if not gemini_api_key.strip(): st.error("Vui lòng nhập Gemini API key trước khi chạy."); return
     jobs: List[Tuple[str, str, str]] = [(item["city"], item["state"], item["sheet_name"]) for item in detected if item["sheet_name"] in selected_sheets]
     used_sheet_names = [item[2] for item in jobs]
     if source:
@@ -923,7 +960,12 @@ def main() -> None:
             if all(sheet.casefold() != preferred_sheet.casefold() for _, _, sheet in jobs):
                 manual_sheet = unique_excel_sheet_name(preferred_sheet, used_sheet_names)
                 jobs.append((manual_city, state.strip(), manual_sheet)); used_sheet_names.append(manual_sheet)
-    if not jobs: st.error("Chọn ít nhất một city sheet hoặc nhập Manual City."); return
+    if not jobs: st.error("Vui lòng chọn ít nhất một sheet hoặc nhập thành phố cần tìm."); return
+    missing_state_cities = [job_city for job_city, job_state, _ in jobs if not job_state]
+    if missing_state_cities:
+        preview = ", ".join(missing_state_cities[:3])
+        st.error(f"Vui lòng nhập mã bang cho: {preview}. Nếu file có nhiều bang, hãy đặt tên sheet theo dạng 'Thành phố, Bang', ví dụ 'Provo, UT'.")
+        return
     st.session_state["scrape_job"] = start_background_job({
         "source": source, "jobs": jobs, "keywords": [x.strip() for x in keywords.splitlines() if x.strip()],
         "limit": int(limit), "parallel_workers": 1, "headless": False, "known": existing_lead_keys(source) if source else set(),
