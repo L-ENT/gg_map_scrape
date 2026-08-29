@@ -1,4 +1,5 @@
 import io
+import threading
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -7,11 +8,18 @@ from app import (
     EXPORT_COLUMNS,
     AI_MODE_MIN_EVIDENCE_CHARS,
     AI_MODE_PENDING_MIN_EVIDENCE_CHARS,
+    Evidence,
     ai_mode_has_pending_marker,
     ai_mode_evidence_is_ready,
+    apply_debug_keep_selection,
     append_rows_preserving_template,
+    candidate_id,
+    existing_lead_keys,
     extract_operation_time_from_text,
     filter_result,
+    lead_identity_keys,
+    merge_gemini_evidence,
+    owner_role_is_explicit,
     promote_updater_payload,
     run_job,
     should_keep_in_final_output,
@@ -125,6 +133,27 @@ def test_debug_callback_receives_each_processed_clinic(monkeypatch):
     assert updates[0]["Practice"] == "Live Clinic"
 
 
+def test_keep_selection_uses_visible_row_number_when_hidden_id_is_missing(monkeypatch):
+    sheet = "Salt Lake City, UT"
+    candidate = {"Practice name": "Capstone Counseling Centers", "location": "Salt Lake City"}
+    item_id = candidate_id(sheet, candidate)
+    saves = []
+    monkeypatch.setattr("app.save_checkpoint_locked", lambda job: saves.append(True))
+    job = {
+        "lock": threading.Lock(),
+        "debug": [{"Candidate ID": item_id, "Keep": False, "Sheet": sheet}],
+        "candidates": {item_id: candidate},
+        "rows_by_sheet": {sheet: []},
+        "message": "",
+    }
+    edited = pd.DataFrame([{"STT": 1, "Keep": True, "Sheet": sheet}])
+
+    assert apply_debug_keep_selection(job, edited) == 1
+    assert job["rows_by_sheet"][sheet] == [candidate]
+    assert job["debug"][0]["Keep"] is True
+    assert saves == [True]
+
+
 def test_keep_logic_and_debug_result_agree_for_matching_clinic():
     verification = {"Is_NonProfit_StateOwned": False, "Contains_Red_Flags": False, "Has_Multiple_Therapists": True, "Contains_Target_Services_Licenses": True, "Owner's name": "N/A"}
     assert should_keep_in_final_output(verification) is True
@@ -135,6 +164,76 @@ def test_keep_logic_and_debug_result_agree_without_qualifying_evidence():
     verification = {"Is_NonProfit_StateOwned": False, "Contains_Red_Flags": False, "Has_Multiple_Therapists": False, "Contains_Target_Services_Licenses": False, "Owner's name": "N/A"}
     assert should_keep_in_final_output(verification) is False
     assert filter_result(verification) == "REJECT: insufficient qualifying evidence"
+
+
+def test_solo_is_rejected_only_when_25_plus_years():
+    base = {"is_solo_practitioner": True, "Contains_Target_Services_Licenses": True}
+    assert filter_result({**base, "mentions_25_plus_years_experience": False}) == "KEEP"
+    assert filter_result({**base, "mentions_25_plus_years_experience": True}) == "REJECT: solo practitioner with 25+ years experience"
+    assert filter_result({"is_solo_practitioner": False, "mentions_25_plus_years_experience": True, "Contains_Target_Services_Licenses": True}) == "KEEP"
+
+
+def test_collective_with_direct_therapist_phone_can_be_kept():
+    collective = {"is_therapist_collective_or_independent": True, "Contains_Target_Services_Licenses": True}
+    assert filter_result({**collective, "Has_Direct_Therapist_Phone": False}) == "REJECT: therapist collective without direct therapist phone"
+    assert filter_result({**collective, "Has_Direct_Therapist_Phone": True}) == "KEEP"
+
+
+def test_collective_phone_exception_does_not_bypass_other_rejection_rules():
+    collective = {
+        "is_therapist_collective_or_independent": True,
+        "Has_Direct_Therapist_Phone": True,
+        "Contains_Target_Services_Licenses": True,
+        "Contains_Disallowed_Provider_Title": True,
+    }
+    assert filter_result(collective) == "REJECT: MD / DO / PMHNP"
+
+
+def test_direct_therapist_phone_is_propagated_to_filter_evidence():
+    evidence = merge_gemini_evidence(Evidence(), {"status": "ok", "direct_therapist_phone": True})
+    assert evidence.direct_therapist_phone is True
+
+
+def test_size_limits_are_unchanged():
+    qualifying = {"Contains_Target_Services_Licenses": True}
+    assert filter_result({**qualifying, "doctor_count": 35}) == "REJECT: 35+ therapists"
+    assert filter_result({**qualifying, "branch_count": 6}) == "REJECT: >5 locations"
+    assert filter_result({**qualifying, "doctor_count": 34, "branch_count": 5}) == "KEEP"
+
+
+def test_owner_role_must_explicitly_prove_ownership():
+    assert owner_role_is_explicit("Co-Founder and CEO") is True
+    assert owner_role_is_explicit("Clinical Director") is False
+    assert owner_role_is_explicit("Likely owner") is False
+    assert owner_role_is_explicit("Former founder") is False
+
+
+def test_identity_keys_match_name_phone_and_official_domain():
+    first = lead_identity_keys({"Practice Name": "Example Therapy, PLLC", "Phone Number": "+1 (801) 555-1212", "Website Link": "https://www.exampletherapy.com/team"})
+    second = lead_identity_keys({"Practice name": "Example Therapy LLC", "phone number": "8015551212", "website link": "https://exampletherapy.com/contact"})
+    assert first == second == {"name:example therapy", "phone:8015551212", "domain:exampletherapy.com"}
+
+
+def test_shared_profile_subdomain_is_not_used_as_an_organization_identity():
+    keys = lead_identity_keys({"Practice Name": "Example Therapy", "Website Link": "https://m.facebook.com/exampletherapy"})
+    assert keys == {"name:example therapy"}
+
+
+def test_uploaded_workbook_without_owner_builds_global_duplicate_keys():
+    source = io.BytesIO()
+    with pd.ExcelWriter(source, engine="openpyxl") as writer:
+        pd.DataFrame([{"Practice Name": "Existing Clinic, LLC", "Phone Number": "801-555-9999", "Website Link": "https://existing.example"}]).to_excel(writer, sheet_name="Provo, UT", index=False)
+    keys = existing_lead_keys(source.getvalue())
+    assert {"name:existing clinic", "phone:8015559999", "domain:existing.example"} <= keys
+
+
+def test_duplicate_phone_skips_ai_mode(monkeypatch):
+    row = {"Practice name": "Renamed Clinic", "phone number": "801-555-1212", "website link": "N/A", "location": "Provo", "operation time and days": "N/A"}
+    monkeypatch.setattr("app.maps_search_urls", lambda *args, **kwargs: [("place", "Different Maps Name")])
+    monkeypatch.setattr("app.extract_maps_place_with_retry", lambda *args, **kwargs: dict(row))
+    monkeypatch.setattr("app.google_ai_overview", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Duplicate must skip AI Mode")))
+    _, debug = run_job(object(), "Provo", "UT", "therapy", 10, {"phone:8015551212"}, lambda message: None, "api-key")
+    assert debug[0]["Filter result"] == "SKIP: duplicate lead"
 
 
 def test_append_rows_preserves_existing_data_and_adds_missing_columns():

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import threading
+import unicodedata
 import uuid
 from queue import Empty, Queue
 from dataclasses import dataclass, field
@@ -72,6 +73,7 @@ class Evidence:
     over_25_years: bool = False; has_board: bool = False; nonprofit: bool = False
     private_practice: Optional[bool] = None; disallowed_provider_title: bool = False
     red_flags: List[str] = field(default_factory=list); target_service: bool = False
+    direct_therapist_phone: bool = False
 
 def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
@@ -95,10 +97,15 @@ def clean_owner_name(value: str) -> str:
     value = re.sub(r"^(?:Dr\.?|Mr\.?|Ms\.?|Mrs\.?)\s+", "", normalize_text(value), flags=re.I)
     value = re.sub(r",\s*(?:LCSW|LMFT|LPC|LMHC|PsyD|PhD|MSW|MA|MS)\b.*$", "", value, flags=re.I).strip(" ,.-")
     parts = value.replace(".", "").split()
-    role_words = {"founder", "owner", "ceo", "director", "clinical", "chief", "executive", "unknown", "n/a", "ai", "mode", "overview", "google"}
+    role_words = {"founder", "owner", "ceo", "director", "clinical", "chief", "executive", "unknown", "n/a", "ai", "mode", "overview", "google", "likely", "probably", "possibly"}
     if len(parts) < 2 or any(part.lower() in role_words for part in parts): return "N/A"
     if not all(re.fullmatch(r"[A-Za-zÀ-ÿ'’-]+", part) for part in parts): return "N/A"
     return value if all(part[0].isupper() for part in parts) else "N/A"
+
+def owner_role_is_explicit(value: Any) -> bool:
+    role = normalize_text(value).lower().replace("-", " ")
+    has_owner_role = bool(re.search(r"\b(?:owner|co owner|founder|co founder|ceo|chief executive officer)\b", role))
+    return has_owner_role and not bool(re.search(r"\b(?:former|previous|past|likely|possible)\b", role))
 
 def should_keep_in_final_output(v: Dict[str, Any]) -> bool:
     """Use the same decision text shown in Debug for the exported result."""
@@ -107,11 +114,15 @@ def should_keep_in_final_output(v: Dict[str, Any]) -> bool:
 def filter_result(v: Dict[str, Any]) -> str:
     """Human-readable reason shown in Debug for every accepted/rejected lead."""
     reasons = []
-    checks = (("Is_NonProfit_StateOwned", "nonprofit / government"), ("Contains_Red_Flags", "disallowed service"), ("Contains_Disallowed_Provider_Title", "MD / DO / PMHNP"), ("is_private_practice", "not a private practice"), ("is_solo_practitioner", "solo practitioner"), ("seems_outdated_or_insufficient_website", "outdated/insufficient evidence"), ("mentions_25_plus_years_experience", "25+ years experience"), ("is_therapist_collective_or_independent", "therapist collective"), ("has_board_of_directors", "board of directors"))
+    checks = (("Is_NonProfit_StateOwned", "nonprofit / government"), ("Contains_Red_Flags", "disallowed service"), ("Contains_Disallowed_Provider_Title", "MD / DO / PMHNP"), ("is_private_practice", "not a private practice"), ("seems_outdated_or_insufficient_website", "outdated/insufficient evidence"), ("has_board_of_directors", "board of directors"))
     for key, label in checks:
         if key == "is_private_practice":
             if v.get(key) is False: reasons.append(label)
         elif v.get(key) is True: reasons.append(label)
+    if v.get("is_solo_practitioner") is True and v.get("mentions_25_plus_years_experience") is True:
+        reasons.append("solo practitioner with 25+ years experience")
+    if v.get("is_therapist_collective_or_independent") is True and v.get("Has_Direct_Therapist_Phone") is not True:
+        reasons.append("therapist collective without direct therapist phone")
     if isinstance(v.get("doctor_count"), (int, float)) and v["doctor_count"] >= MAX_DOCTOR_COUNT: reasons.append(f"{MAX_DOCTOR_COUNT}+ therapists")
     if isinstance(v.get("branch_count"), (int, float)) and v["branch_count"] > MAX_BRANCH_COUNT: reasons.append(f">{MAX_BRANCH_COUNT} locations")
     if reasons:
@@ -124,7 +135,7 @@ def filter_result(v: Dict[str, Any]) -> str:
     return "KEEP" if has_qualifying_evidence else "REJECT: insufficient qualifying evidence"
 
 def evidence_as_verification(e: Evidence) -> Dict[str, Any]:
-    return {"Owner's name": e.owner, "doctor_count": e.doctor_count, "branch_count": e.branch_count, "Is_NonProfit_StateOwned": e.nonprofit, "is_private_practice": e.private_practice, "Contains_Red_Flags": bool(e.red_flags), "Contains_Disallowed_Provider_Title": e.disallowed_provider_title, "is_solo_practitioner": e.is_solo, "seems_outdated_or_insufficient_website": e.old_or_insufficient, "mentions_25_plus_years_experience": e.over_25_years, "is_therapist_collective_or_independent": e.is_collective, "has_board_of_directors": e.has_board, "Contains_Target_Services_Licenses": e.target_service, "Has_Multiple_Therapists": bool(e.doctor_count and e.doctor_count > 1)}
+    return {"Owner's name": e.owner, "doctor_count": e.doctor_count, "branch_count": e.branch_count, "Is_NonProfit_StateOwned": e.nonprofit, "is_private_practice": e.private_practice, "Contains_Red_Flags": bool(e.red_flags), "Contains_Disallowed_Provider_Title": e.disallowed_provider_title, "is_solo_practitioner": e.is_solo, "seems_outdated_or_insufficient_website": e.old_or_insufficient, "mentions_25_plus_years_experience": e.over_25_years, "is_therapist_collective_or_independent": e.is_collective, "has_board_of_directors": e.has_board, "Contains_Target_Services_Licenses": e.target_service, "Has_Multiple_Therapists": bool(e.doctor_count and e.doctor_count > 1), "Has_Direct_Therapist_Phone": e.direct_therapist_phone}
 
 def build_driver(headless: bool) -> webdriver.Chrome:
     options = Options()
@@ -270,7 +281,7 @@ def extract_maps_place_with_retry(driver: webdriver.Chrome, url: str, city: str,
 
 def _google_ai_overview_once(driver: webdriver.Chrome, name: str, city: str, state: str, status: Any, should_stop: Optional[Any] = None) -> str:
     """Use one focused AI Mode request to gather every lead-screening fact."""
-    query = f'"{name}" {city} {state} briefly list owner, hours, private/nonprofit/government status, therapist count, locations, services including IOP, addiction, medication management, case management, peer support, medical treatment, solo/collective, board, 25+ years, MD/DO/PMHNP'
+    query = f'"{name}" {city} {state} briefly list explicit owner/founder/CEO and role, hours, private/nonprofit/government status, exact therapist count, actual locations, services including IOP, addiction, medication management, case management, peer support, medical treatment, solo/collective, whether a named therapist has a direct personal phone, board, 25+ years, MD/DO/PMHNP'
     driver.get(f"https://www.google.com/search?udm=50&q={quote_plus(query)}"); time.sleep(2.2); maybe_accept_google_consent(driver)
     if not wait_for_manual_captcha(driver, status, should_stop): return ""
     # `udm=50` is Google Search's AI Mode surface. Streaming answers can exceed
@@ -398,7 +409,7 @@ def gemini_retry_delay(response: Any, attempt: int) -> float:
 
 def gemini_metadata(api_key: str, row: Dict[str, Any], ai_overview: str) -> Dict[str, Any]:
     """Strict JSON fact extraction from Maps/AI Overview, with no website crawl."""
-    fallback = {"owner": "N/A", "operation_time_and_days": "N/A", "doctor_count": None, "branch_count": None, "is_solo": None, "is_collective": None, "nonprofit": None, "private_practice": None, "target_service": None, "red_flags": [], "disallowed_provider_title": None, "outdated_or_insufficient": None, "over_25_years": None, "has_board": None, "status": "not_called"}
+    fallback = {"owner": "N/A", "owner_role": "N/A", "operation_time_and_days": "N/A", "doctor_count": None, "branch_count": None, "is_solo": None, "is_collective": None, "direct_therapist_phone": None, "nonprofit": None, "private_practice": None, "target_service": None, "red_flags": [], "disallowed_provider_title": None, "outdated_or_insufficient": None, "over_25_years": None, "has_board": None, "status": "not_called"}
     if not api_key.strip(): return fallback
     maps_text = normalize_text(row.get("maps raw text", ""))
     ai_text = normalize_text(ai_overview or "Not shown")
@@ -407,7 +418,7 @@ def gemini_metadata(api_key: str, row: Dict[str, Any], ai_overview: str) -> Dict
     with _GEMINI_CACHE_LOCK:
         cached = _GEMINI_CACHE.get(cache_key)
     if cached is not None: return cached
-    prompt = """You extract verifiable facts for a US therapy/counseling clinic lead. Use ONLY the supplied Google Maps text and visible Google AI Mode response. Do not use website content, do not browse, and do not invent. Return one JSON object only with exactly these keys: owner (an explicit full personal founder/owner/CEO/clinical-director name, otherwise 'N/A'; NEVER return a role), operation_time_and_days (a concise schedule with days and valid AM/PM times only when explicitly stated, otherwise 'N/A'), doctor_count (integer or null), branch_count (integer or null), is_solo (true/false/null), is_collective (true/false/null), nonprofit (true/false/null), private_practice (true/false/null), target_service (true/false/null only for individual/couples/family/teen therapy, anxiety, depression, trauma, ADHD, bipolar, OCD, DBT, CBT, EMDR, play, art, IFS or listed licenses), red_flags (array containing only actual, directly offered clinic services among intensive outpatient, substance abuse, addiction treatment, medical treatment, peer support, medication management, case management, psychiatric hospital), disallowed_provider_title (true only for an explicit MD, DO, or PMHNP provider; otherwise false/null), outdated_or_insufficient (true only when the evidence explicitly says permanently closed, website down/unavailable/outdated, otherwise false/null), over_25_years (true only for an explicit 25+ years of experience/serving claim, otherwise false/null), has_board (true only for an explicit board of directors, otherwise false/null). For red_flags: include an item ONLY when this clinic directly provides it as a real program/service. Never include it when the evidence says it is not offered, is only a referral to another provider, is offered by a parent/partner/sister organization rather than this clinic, or merely mentions a client condition, a search question, a support group, academic support, or ordinary psychotherapy. In particular, do not treat behavior issues (for example pornography/gaming struggles) as substance abuse or addiction treatment unless a dedicated substance-use/addiction-treatment program is explicitly offered. Do not treat group/family therapy as peer support, or treatment planning as case management. For is_collective: return true ONLY when evidence explicitly calls it a therapist/independent-therapist collective, or says clinicians operate independently under a collective umbrella. Return false for an ordinary group practice, a clinic with a team, a multi-therapist private practice, a collaborative staff, or co-owned practice; those are valid prospects and are not therapist collectives. For nonprofit: return false when the evidence explicitly says it is private, for-profit, or 'not a nonprofit/government agency'. State licensing, Medicaid/public insurance, court approval, government regulation, or a .gov citation do NOT make a private clinic government-owned. Return true only for an affirmative nonprofit, state-owned, government-owned, government-run, or government-funded claim.\n\nEVIDENCE:\n""" + evidence
+    prompt = """You extract verifiable facts for a US therapy/counseling clinic lead. Use ONLY the supplied Google Maps text and visible Google AI Mode response. Do not use website content, do not browse, and do not invent. Return one JSON object only with exactly these keys: owner (one explicit full personal name, otherwise 'N/A'), owner_role (the explicit role proving ownership: owner, co-owner, founder, co-founder, CEO, or chief executive officer; otherwise 'N/A'), operation_time_and_days (a concise schedule with days and valid AM/PM times only when explicitly stated, otherwise 'N/A'), doctor_count (exact current number of therapists/providers as an integer only when explicitly supported, otherwise null; never convert 'under 10', ranges, directory result counts, or estimates into an integer), branch_count (exact number of physical locations operated by this practice only when explicitly supported, otherwise null; do not count telehealth service areas, nearby cities, partner organizations, or places merely mentioned), is_solo (true/false/null), is_collective (true/false/null), direct_therapist_phone (true only when the evidence explicitly associates a distinct direct/personal phone number with a named therapist; a clinic reception, main office, call center, shared scheduling, or unlabeled Maps phone is false/null), nonprofit (true/false/null), private_practice (true/false/null), target_service (true/false/null only for individual/couples/family/teen therapy, anxiety, depression, trauma, ADHD, bipolar, OCD, DBT, CBT, EMDR, play, art, IFS or listed licenses), red_flags (array containing only actual, directly offered clinic services among intensive outpatient, substance abuse, addiction treatment, medical treatment, peer support, medication management, case management, psychiatric hospital), disallowed_provider_title (true only for an explicit MD, DO, or PMHNP provider; otherwise false/null), outdated_or_insufficient (true only when the evidence explicitly says permanently closed, website down/unavailable/outdated, otherwise false/null), over_25_years (true only for an explicit 25+ years of experience/serving claim, otherwise false/null), has_board (true only for an explicit board of directors, otherwise false/null). Owner accuracy is strict: owner and owner_role must refer to the same named person in an explicit ownership statement. Never infer ownership from clinical director, authorized official, therapist, contact person, domain registration, seniority, or phrases such as 'likely managed by'. For red_flags: include an item ONLY when this clinic directly provides it as a real program/service. Never include it when the evidence says it is not offered, is only a referral to another provider, is offered by a parent/partner/sister organization rather than this clinic, or merely mentions a client condition, a search question, a support group, academic support, or ordinary psychotherapy. In particular, do not treat behavior issues (for example pornography/gaming struggles) as substance abuse or addiction treatment unless a dedicated substance-use/addiction-treatment program is explicitly offered. Do not treat group/family therapy as peer support, or treatment planning as case management. For is_collective: return true ONLY when evidence explicitly calls it a therapist/independent-therapist collective, or says clinicians operate independently under a collective umbrella. Return false for an ordinary group practice, a clinic with a team, a multi-therapist private practice, a collaborative staff, or co-owned practice; those are valid prospects and are not therapist collectives. For nonprofit: return false when the evidence explicitly says it is private, for-profit, or 'not a nonprofit/government agency'. State licensing, Medicaid/public insurance, court approval, government regulation, or a .gov citation do NOT make a private clinic government-owned. Return true only for an affirmative nonprofit, state-owned, government-owned, government-run, or government-funded claim.\n\nEVIDENCE:\n""" + evidence
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key.strip()}"
     try:
         response = None
@@ -426,7 +437,8 @@ def gemini_metadata(api_key: str, row: Dict[str, Any], ai_overview: str) -> Dict
             fallback["status"] = "invalid JSON shape"
             return fallback
         result = {**fallback, **{key: parsed.get(key, fallback[key]) for key in fallback if key != "status"}, "status": "ok"}
-        result["owner"] = clean_owner_name(str(result["owner"])) if result["owner"] else "N/A"
+        result["owner"] = clean_owner_name(str(result["owner"])) if owner_role_is_explicit(result.get("owner_role")) and result["owner"] else "N/A"
+        if result["owner"] == "N/A": result["owner_role"] = "N/A"
         result["operation_time_and_days"] = normalize_text(result["operation_time_and_days"]) or "N/A"
         if result["operation_time_and_days"] != "N/A" and extract_operation_time_from_text(result["operation_time_and_days"]) == "N/A": result["operation_time_and_days"] = "N/A"
         result["red_flags"] = [str(x).lower() for x in result["red_flags"] if str(x).lower() in RED_FLAG_TERMS]
@@ -448,6 +460,8 @@ def merge_gemini_evidence(base: Evidence, metadata: Dict[str, Any]) -> Evidence:
         if metadata.get(key) in (True, False): setattr(base, attr, metadata[key])
     for attr, key in (("private_practice", "private_practice"), ("target_service", "target_service")):
         if metadata.get(key) in (True, False): setattr(base, attr, metadata[key])
+    if metadata.get("direct_therapist_phone") in (True, False):
+        base.direct_therapist_phone = metadata["direct_therapist_phone"]
     base.red_flags = list(metadata.get("red_flags", []))
     return base
 
@@ -456,6 +470,39 @@ def format_export(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 
 def lead_key(name: Any, city: Any) -> Tuple[str, str]:
     return normalize_text(name).lower(), normalize_text(city).lower()
+
+def normalized_practice_name(value: Any) -> str:
+    """Normalize harmless spelling/legal-suffix differences for deduplication."""
+    text = unicodedata.normalize("NFKD", normalize_text(value)).encode("ascii", "ignore").decode("ascii").lower()
+    text = re.sub(r"\b(?:llc|pllc|inc|corp|corporation|company|co)\b", " ", text)
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+def normalized_phone(value: Any) -> str:
+    digits = re.sub(r"\D", "", normalize_text(value))
+    if len(digits) == 11 and digits.startswith("1"): digits = digits[1:]
+    return digits if len(digits) >= 10 else ""
+
+def normalized_website_domain(value: Any) -> str:
+    website = normalize_text(value)
+    if not website or website.upper() in {"N/A", "LINK", "WEBSITE"}: return ""
+    if "://" not in website: website = "https://" + website
+    domain = (urlparse(website).hostname or "").lower().removeprefix("www.")
+    # Directory/social profiles are shared by unrelated practices and therefore
+    # cannot identify an organization safely.
+    shared_domains = {"google.com", "maps.google.com", "facebook.com", "instagram.com", "linkedin.com", "psychologytoday.com", "yelp.com"}
+    is_shared = any(domain == shared or domain.endswith("." + shared) for shared in shared_domains)
+    return "" if not domain or is_shared else domain
+
+def lead_identity_keys(row: Dict[str, Any]) -> set:
+    """Return independent organization identifiers; any exact match is a duplicate."""
+    name = normalized_practice_name(row.get("Practice name", row.get("Practice Name", "")))
+    phone = normalized_phone(row.get("phone number", row.get("Phone Number", "")))
+    domain = normalized_website_domain(row.get("website link", row.get("Website Link", "")))
+    keys = set()
+    if len(name) >= 5: keys.add(f"name:{name}")
+    if phone: keys.add(f"phone:{phone}")
+    if domain: keys.add(f"domain:{domain}")
+    return keys
 
 def candidate_id(sheet: str, row: Dict[str, Any]) -> str:
     name, city = lead_key(row.get("Practice name", ""), row.get("location", ""))
@@ -467,9 +514,12 @@ def existing_lead_keys(workbook_bytes: bytes) -> set:
         for sheet in book.sheet_names:
             df = pd.read_excel(book, sheet_name=sheet, dtype=str).fillna(""); cols = {str(c).lower().strip(): c for c in df.columns}
             if "practice name" in cols:
-                fallback_city = sheet.split(",", 1)[0].strip()
-                city_column = cols.get("location (city ne only)") or cols.get("location")
-                for _, row in df.iterrows(): found.add(lead_key(row[cols["practice name"]], row[city_column] if city_column else fallback_city))
+                for _, row in df.iterrows():
+                    found.update(lead_identity_keys({
+                        "Practice Name": row[cols["practice name"]],
+                        "Phone Number": row[cols["phone number"]] if "phone number" in cols else "",
+                        "Website Link": row[cols["website link"]] if "website link" in cols else "",
+                    }))
     return found
 
 def discover_city_sheets(workbook_bytes: bytes, fallback_state: str = "") -> List[Dict[str, str]]:
@@ -559,19 +609,32 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
         else:
             progress(f"{city}: {keyword} — {position}/{len(places)}")
         row: Optional[Dict[str, Any]] = None
+        reserved_keys = set()
         try:
+            if saved_row is None:
+                hint_keys = lead_identity_keys({"Practice name": name_hint})
+                if hint_keys:
+                    if known_lock:
+                        with known_lock: hint_is_duplicate = bool(hint_keys & known)
+                    else: hint_is_duplicate = bool(hint_keys & known)
+                    if hint_is_duplicate:
+                        record_debug({"Practice": name_hint, "Keep": False, "Filter result": "SKIP: duplicate lead", "Owner": "N/A", "Operation Time": "N/A", "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "not called", "Gemini": "not called", "Reasons": "Matched an existing normalized practice name before AI Mode"})
+                        continue
             row = dict(saved_row) if saved_row is not None else extract_maps_place_with_retry(driver, url, city, name_hint, progress, should_stop)
             if should_stop and should_stop(): break
-            key = lead_key(row["Practice name"], row["location"])
             if row["Practice name"] == "N/A":
                 record_debug({"Practice": "N/A", "Keep": False, "Filter result": "SKIP: không đọc được tên từ Google Maps", "Owner": "N/A", "Operation Time": "N/A", "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "N/A", "Gemini": "not called", "Reasons": "Google Maps listing could not be read"})
                 continue
+            reserved_keys = lead_identity_keys(row)
             if known_lock:
                 with known_lock:
-                    if key in known: continue
-                    known.add(key)
-            elif key in known:
-                # Duplicate leads are deliberately skipped without cluttering Debug.
+                    is_duplicate = bool(reserved_keys & known)
+                    if not is_duplicate: known.update(reserved_keys)
+            else:
+                is_duplicate = bool(reserved_keys & known)
+                if not is_duplicate: known.update(reserved_keys)
+            if is_duplicate:
+                record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": "SKIP: duplicate lead", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "not called", "Gemini": "not called", "Reasons": "Matched an existing practice name, direct phone, or official website domain"})
                 continue
             ai_mode_evidence = google_ai_overview(driver, row["Practice name"], city, state, progress, should_stop)
             if should_stop and should_stop(): break
@@ -581,9 +644,9 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                 # encounter retry this clinic instead of permanently deduplicating it.
                 if known_lock:
                     with known_lock:
-                        known.discard(key)
+                        known.difference_update(reserved_keys)
                 else:
-                    known.discard(key)
+                    known.difference_update(reserved_keys)
                 if not deferred_retry:
                     work_items.append((url, row["Practice name"], dict(row), True))
                     if on_retry_waiting: on_retry_waiting(1)
@@ -596,12 +659,15 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
             gemini_hours = metadata.get("operation_time_and_days", "N/A")
             if metadata.get("status") == "ok" and gemini_hours != "N/A": row["operation time and days"] = gemini_hours
             keep = should_keep_in_final_output(v)
-            if not known_lock: known.add(key)
             if keep:
                 accepted.append(row)
                 if on_accept: on_accept(row)
-            record_debug({"Practice": row["Practice name"], "Keep": keep, "Filter result": filter_result(v), "Owner": e.owner, "Operation Time": row["operation time and days"], "Therapists": str(e.doctor_count) if e.doctor_count is not None else "UNKNOWN", "Private practice": "YES" if e.private_practice is True else ("NO" if e.private_practice is False else "UNKNOWN"), "Target services": "YES" if e.target_service is True else ("NO" if e.target_service is False else "UNKNOWN"), "AI Mode evidence": ai_mode_evidence, "Gemini": metadata.get("status"), "Reasons": "; ".join(e.red_flags) or "eligible / insufficient evidence", "_export_row": dict(row)})
+            record_debug({"Practice": row["Practice name"], "Keep": keep, "Filter result": filter_result(v), "Owner": e.owner, "Operation Time": row["operation time and days"], "Therapists": str(e.doctor_count) if e.doctor_count is not None else "UNKNOWN", "Private practice": "YES" if e.private_practice is True else ("NO" if e.private_practice is False else "UNKNOWN"), "Target services": "YES" if e.target_service is True else ("NO" if e.target_service is False else "UNKNOWN"), "Direct therapist phone": "YES" if e.direct_therapist_phone else "NO", "AI Mode evidence": ai_mode_evidence, "Gemini": metadata.get("status"), "Reasons": "; ".join(e.red_flags) or "eligible / insufficient evidence", "_export_row": dict(row)})
         except (TimeoutException, WebDriverException) as exc:
+            if reserved_keys:
+                if known_lock:
+                    with known_lock: known.difference_update(reserved_keys)
+                else: known.difference_update(reserved_keys)
             practice = row.get("Practice name", "N/A") if row else "N/A"
             record_debug({"Practice": practice, "Keep": False, "Filter result": f"Google UI error after retry: {type(exc).__name__}", "Owner": "N/A", "Operation Time": row.get("operation time and days", "N/A") if row else "N/A", "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "N/A", "Gemini": "not called", "Reasons": f"Google UI error: {type(exc).__name__}"})
         finally:
@@ -824,9 +890,21 @@ def apply_debug_keep_selection(job: Dict[str, Any], edited_debug: pd.DataFrame) 
     with job["lock"]:
         for _, debug_row in edited_debug.iterrows():
             selected = bool(debug_row.get("Keep", False)); item_id = normalize_text(debug_row.get("Candidate ID", ""))
+            # Some Streamlit versions omit columns hidden through column_config
+            # from the edited dataframe. STT is visible and stable, so use it to
+            # recover the internal candidate id instead of silently ignoring the
+            # person's checkbox change.
+            if not item_id:
+                try: position = int(debug_row.get("STT", 0)) - 1
+                except (TypeError, ValueError): position = -1
+                if 0 <= position < len(job["debug"]):
+                    item_id = normalize_text(job["debug"][position].get("Candidate ID", ""))
             candidate = job["candidates"].get(item_id)
             if not candidate: continue
             sheet = normalize_text(debug_row.get("Sheet", ""))
+            if not sheet:
+                stored_item = next((item for item in job["debug"] if item.get("Candidate ID") == item_id), {})
+                sheet = normalize_text(stored_item.get("Sheet", ""))
             if sheet not in job["rows_by_sheet"]: continue
             for stored_debug in job["debug"]:
                 if stored_debug.get("Candidate ID") == item_id:
@@ -897,12 +975,14 @@ def _render_background_job(job: Dict[str, Any]) -> None:
             debug_frame.insert(0, "STT", range(1, len(debug_frame) + 1))
             editable_columns = [column for column in debug_frame.columns if column != "Keep"]
             edited_debug = st.data_editor(
-                debug_frame, hide_index=True, width="stretch", key="evidence_debug_editor",
+                debug_frame, hide_index=True, width="stretch", key=f"evidence_debug_editor_{Path(job['checkpoint_path']).stem}",
                 disabled=editable_columns,
                 column_config={"STT": st.column_config.NumberColumn("STT", width="small"), "Keep": st.column_config.CheckboxColumn("Keep", help="Tick để lưu lead này vào file kết quả."), "Candidate ID": None},
             )
             if apply_debug_keep_selection(job, edited_debug):
-                st.success("Đã lưu lựa chọn vào checkpoint. Các dòng mới trong file Excel upload sẽ được tô vàng.")
+                # The download button above was rendered from the previous byte
+                # snapshot. Rerun immediately so it receives the newly saved file.
+                st.rerun()
     if running:
         st.caption("Kết quả được lưu sau mỗi lead đạt yêu cầu; trạng thái và bảng kiểm tra tự cập nhật mỗi 3 giây.")
     else:
