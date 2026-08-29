@@ -857,11 +857,12 @@ def _render_background_job(job: Dict[str, Any]) -> None:
         if debug_frame.empty:
             st.caption("Chưa có lead nào được kiểm tra.")
         else:
+            debug_frame.insert(0, "STT", range(1, len(debug_frame) + 1))
             editable_columns = [column for column in debug_frame.columns if column != "Keep"]
             edited_debug = st.data_editor(
                 debug_frame, hide_index=True, width="stretch", key="evidence_debug_editor",
                 disabled=editable_columns,
-                column_config={"Keep": st.column_config.CheckboxColumn("Keep", help="Tick để lưu lead này vào file kết quả."), "Candidate ID": None},
+                column_config={"STT": st.column_config.NumberColumn("STT", width="small"), "Keep": st.column_config.CheckboxColumn("Keep", help="Tick để lưu lead này vào file kết quả."), "Candidate ID": None},
             )
             if apply_debug_keep_selection(job, edited_debug):
                 st.success("Đã lưu lựa chọn vào checkpoint. Các dòng mới trong file Excel upload sẽ được tô vàng.")
