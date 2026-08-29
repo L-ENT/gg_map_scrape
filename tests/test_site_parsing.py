@@ -88,12 +88,20 @@ def test_ai_mode_failure_is_retried_after_the_main_list(monkeypatch):
         "target_service": True, "red_flags": [], "disallowed_provider_title": False,
         "outdated_or_insufficient": False, "over_25_years": False, "has_board": False,
     })
+    candidate_progress = []
+    retry_waiting_changes = []
 
-    accepted, debug = run_job(object(), "Provo", "UT", "therapy", 10, set(), lambda message: None, "api-key")
+    accepted, debug = run_job(
+        object(), "Provo", "UT", "therapy", 10, set(), lambda message: None, "api-key",
+        on_candidate_progress=lambda done, total: candidate_progress.append((done, total)),
+        on_retry_waiting=retry_waiting_changes.append,
+    )
 
     assert ai_order == ["First Clinic", "Second Clinic", "First Clinic"]
     assert {row["Practice name"] for row in accepted} == {"First Clinic", "Second Clinic"}
     assert all(item["Filter result"] != "RETRY: AI Mode chưa hoàn tất" for item in debug)
+    assert candidate_progress == [(1, 2), (2, 2)]
+    assert retry_waiting_changes == [1, -1]
 
 
 def test_captcha_wait_can_be_stopped_without_a_timeout(monkeypatch):

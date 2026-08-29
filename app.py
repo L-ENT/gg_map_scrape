@@ -541,7 +541,7 @@ def new_workbook(rows_by_sheet: Dict[str, pd.DataFrame]) -> bytes:
         for sheet, rows in rows_by_sheet.items(): rows.to_excel(writer, sheet_name=sheet, index=False)
     return output.getvalue()
 
-def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit: int, known: set, progress: Any, gemini_api_key: str = "", on_accept: Optional[Any] = None, on_debug: Optional[Any] = None, should_stop: Optional[Any] = None, known_lock: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit: int, known: set, progress: Any, gemini_api_key: str = "", on_accept: Optional[Any] = None, on_debug: Optional[Any] = None, on_candidate_progress: Optional[Any] = None, on_retry_waiting: Optional[Any] = None, should_stop: Optional[Any] = None, known_lock: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     accepted: List[Dict[str, Any]] = []; debug: List[Dict[str, Any]] = []
     def record_debug(item: Dict[str, Any]) -> None:
         debug.append(item)
@@ -554,6 +554,7 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
     for position, (url, name_hint, saved_row, deferred_retry) in enumerate(work_items, 1):
         if should_stop and should_stop(): break
         if deferred_retry:
+            if on_retry_waiting: on_retry_waiting(-1)
             progress(f"{city}: đang thử lại AI Mode cuối lượt cho {name_hint}…")
         else:
             progress(f"{city}: {keyword} — {position}/{len(places)}")
@@ -585,6 +586,7 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                     known.discard(key)
                 if not deferred_retry:
                     work_items.append((url, row["Practice name"], dict(row), True))
+                    if on_retry_waiting: on_retry_waiting(1)
                     progress(f"{row['Practice name']}: hai lần thử AI Mode chưa thành công; đã đưa vào danh sách chờ cuối lượt.")
                     continue
                 record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": "RETRY: AI Mode chưa hoàn tất", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "", "Gemini": "not called", "Reasons": "AI Mode did not produce a complete stable answer after retries"})
@@ -602,6 +604,9 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
         except (TimeoutException, WebDriverException) as exc:
             practice = row.get("Practice name", "N/A") if row else "N/A"
             record_debug({"Practice": practice, "Keep": False, "Filter result": f"Google UI error after retry: {type(exc).__name__}", "Owner": "N/A", "Operation Time": row.get("operation time and days", "N/A") if row else "N/A", "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "N/A", "Gemini": "not called", "Reasons": f"Google UI error: {type(exc).__name__}"})
+        finally:
+            if not deferred_retry and on_candidate_progress:
+                on_candidate_progress(min(position, len(places)), len(places))
     return accepted, debug
 
 def checkpoint_output(source: bytes, rows_by_sheet: Dict[str, List[Dict[str, Any]]]) -> bytes:
@@ -716,6 +721,8 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
         **config, "lock": threading.Lock(), "stop_event": threading.Event(), "running": True,
         "message": "Đang chuẩn bị…", "error": "",
         "known_lock": threading.Lock(), "captcha_workers": {},
+        "task_total": len(config["jobs"]) * len(config["keywords"]),
+        "tasks_completed": 0, "task_progress": {}, "retry_waiting": 0,
         "rows_by_sheet": {sheet: [] for _, _, sheet in config["jobs"]}, "debug": [], "candidates": {},
         "checkpoint_path": str(checkpoint_dir / f"clinic_leads_checkpoint_{uuid.uuid4().hex[:8]}.xlsx"),
         "checkpoint_bytes": b"", "captcha_active": False, "captcha_notified": False, "captcha_sound_played": False,
@@ -761,11 +768,25 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                                     item["Candidate ID"] = candidate_id(target_sheet, export_row)
                                     job["candidates"][item["Candidate ID"]] = export_row
                                 job["debug"].append({**item, "Sheet": target_sheet, "City": city, "State": state})
-                        run_job(driver, city, state, keyword, job["limit"], job["known"], progress, job["gemini_api_key"], on_accept, on_debug, job["stop_event"].is_set, job["known_lock"])
+                        def on_candidate_progress(done: int, total: int) -> None:
+                            with job["lock"]:
+                                job["task_progress"][worker_number] = (0.9 * done / total) if total else 0.0
+                        def on_retry_waiting(delta: int) -> None:
+                            with job["lock"]:
+                                job["retry_waiting"] = max(0, job["retry_waiting"] + delta)
+                        run_job(
+                            driver, city, state, keyword, job["limit"], job["known"], progress, job["gemini_api_key"],
+                            on_accept=on_accept, on_debug=on_debug,
+                            on_candidate_progress=on_candidate_progress, on_retry_waiting=on_retry_waiting,
+                            should_stop=job["stop_event"].is_set, known_lock=job["known_lock"],
+                        )
                     except Exception as exc:
                         with job["lock"]:
                             job["debug"].append({"Practice": "N/A", "Keep": False, "Filter result": f"Chrome worker error: {type(exc).__name__}", "Reasons": str(exc), "Sheet": sheet, "City": city, "State": state})
                     finally:
+                        with job["lock"]:
+                            job["tasks_completed"] += 1
+                            job["task_progress"].pop(worker_number, None)
                         tasks.task_done()
             except Exception as exc:
                 with job["lock"]:
@@ -792,6 +813,7 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                 job["message"] = "Có lỗi, nhưng checkpoint đã được lưu."
         finally:
             with job["lock"]:
+                job["retry_waiting"] = 0
                 job["running"] = False
     threading.Thread(target=worker, daemon=True, name="clinic-scraper").start()
     return job
@@ -829,8 +851,23 @@ def _render_background_job(job: Dict[str, Any]) -> None:
         bytes_now = job["checkpoint_bytes"]
         summary = pd.DataFrame([{"Sheet": sheet, "Lead mới đã lưu": len(rows)} for sheet, rows in job["rows_by_sheet"].items()])
         debug = list(job["debug"]); notify = job["captcha_active"] and not job["captcha_notified"]
+        task_total = max(1, int(job.get("task_total", 1)))
+        tasks_completed = int(job.get("tasks_completed", 0))
+        overall_units = tasks_completed + sum(job.get("task_progress", {}).values())
+        overall_progress = min(1.0, overall_units / task_total)
+        checked_count = len(debug)
+        kept_count = sum(bool(item.get("Keep")) for item in debug)
+        rejected_count = max(0, checked_count - kept_count)
+        retry_waiting = int(job.get("retry_waiting", 0))
         if notify: job["captcha_notified"] = True
     st.info(message)
+    progress_percent = round(overall_progress * 100)
+    st.progress(overall_progress, text=f"Tiến độ tổng thể: {progress_percent}% — hoàn tất {tasks_completed}/{task_total} nhóm thành phố × từ khóa")
+    checked_col, kept_col, rejected_col, retry_col = st.columns(4)
+    checked_col.metric("Đã kiểm tra", checked_count)
+    kept_col.metric("Giữ lại", kept_count)
+    rejected_col.metric("Loại", rejected_count)
+    retry_col.metric("Chờ thử lại", retry_waiting)
     if notify:
         st.warning("CAPTCHA đang chặn Google. Hãy mở cửa sổ Chrome và xác minh thủ công để bot tiếp tục.")
         components.html("""<script>
