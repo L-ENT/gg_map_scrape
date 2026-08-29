@@ -15,6 +15,7 @@ from app import (
     promote_updater_payload,
     run_job,
     should_keep_in_final_output,
+    wait_for_manual_captcha,
 )
 
 
@@ -59,6 +60,27 @@ def test_incomplete_ai_mode_is_not_sent_to_gemini(monkeypatch):
     assert debug[0]["Filter result"] == "RETRY: AI Mode chưa hoàn tất"
     assert debug[0]["Gemini"] == "not called"
     assert ("incomplete clinic", "provo") not in known
+
+
+def test_captcha_wait_can_be_stopped_without_a_timeout(monkeypatch):
+    messages = []
+    monkeypatch.setattr("app.captcha_is_visible", lambda driver: True)
+
+    assert wait_for_manual_captcha(object(), messages.append, lambda: True) is False
+    assert messages == ["Đã dừng trong khi chờ xác minh CAPTCHA."]
+
+
+def test_debug_callback_receives_each_processed_clinic(monkeypatch):
+    row = {"Practice name": "Live Clinic", "location": "Provo", "operation time and days": "N/A"}
+    monkeypatch.setattr("app.maps_search_urls", lambda *args, **kwargs: [("https://maps.test/place", "Live Clinic")])
+    monkeypatch.setattr("app.extract_maps_place_with_retry", lambda *args, **kwargs: dict(row))
+    monkeypatch.setattr("app.google_ai_overview", lambda *args, **kwargs: "")
+    updates = []
+
+    run_job(object(), "Provo", "UT", "therapy", 10, set(), lambda message: None, "api-key", on_debug=updates.append)
+
+    assert len(updates) == 1
+    assert updates[0]["Practice"] == "Live Clinic"
 
 
 def test_keep_logic_and_debug_result_agree_for_matching_clinic():

@@ -154,19 +154,17 @@ def captcha_is_visible(driver: webdriver.Chrome) -> bool:
     except WebDriverException:
         return False
 
-def wait_for_manual_captcha(driver: webdriver.Chrome, status: Any, timeout_seconds: int) -> bool:
-    """Pause automation so the person at the visible Chrome window can verify."""
+def wait_for_manual_captcha(driver: webdriver.Chrome, status: Any, should_stop: Optional[Any] = None) -> bool:
+    """Wait for manual verification until it succeeds or the user stops the job."""
     if not captcha_is_visible(driver): return True
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        remaining = max(0, int(deadline - time.time()))
-        status(f"Google đang yêu cầu CAPTCHA — hãy xác minh thủ công trong cửa sổ Chrome ({remaining}s còn lại).")
+    while captcha_is_visible(driver):
+        if should_stop and should_stop():
+            status("Đã dừng trong khi chờ xác minh CAPTCHA.")
+            return False
+        status("Google đang yêu cầu CAPTCHA — hãy xác minh trong cửa sổ Chrome. App sẽ chờ cho đến khi bạn hoàn tất.")
         time.sleep(2)
-        if not captcha_is_visible(driver):
-            status("Đã xác minh CAPTCHA, tiếp tục quét…")
-            return True
-    status("Hết thời gian chờ CAPTCHA; bỏ qua trang này và tiếp tục các lead khác.")
-    return False
+    status("Đã xác minh CAPTCHA, tiếp tục quét…")
+    return True
 
 def maps_results_exhausted(driver: webdriver.Chrome) -> bool:
     """Return True only for Google Maps' explicit no-results/end-of-list UI."""
@@ -193,10 +191,10 @@ def maps_card_name_hint(card: Any, href: str) -> str:
     match = re.search(r"/maps/place/([^/@?]+)", href)
     return normalize_text(unquote_plus(match.group(1))) if match else "N/A"
 
-def maps_search_urls(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit: int, status: Any, captcha_wait_seconds: int) -> List[Tuple[str, str]]:
+def maps_search_urls(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit: int, status: Any, should_stop: Optional[Any] = None) -> List[Tuple[str, str]]:
     query = f"{keyword} in {city}, {state}, USA" if state else f"{keyword} in {city}"
     driver.get(f"https://www.google.com/maps/search/{quote_plus(query)}"); time.sleep(2); maybe_accept_google_consent(driver)
-    if not wait_for_manual_captcha(driver, status, captcha_wait_seconds): return []
+    if not wait_for_manual_captcha(driver, status, should_stop): return []
     places: List[Tuple[str, str]] = []; seen_urls = set(); stale = 0; scroll_rounds = 0
     while len(places) < limit:
         before = len(places)
@@ -247,7 +245,7 @@ def extract_maps_place(driver: webdriver.Chrome, url: str, city: str, name_hint:
     rating = maps_value(driver, ("div.F7nice span[aria-label*='star']", "span[aria-label*='star']")); match = re.search(r"\b(\d(?:\.\d)?)\s*(?:stars?|sao)\b", rating, re.I)
     return {"Practice name": name, "phone number": phone, "website link": website, "location": city, "operation time and days": extract_operation_time_from_text(raw), "rating star": match.group(1) if match else "N/A", "maps raw text": raw}
 
-def extract_maps_place_with_retry(driver: webdriver.Chrome, url: str, city: str, name_hint: str, status: Any, captcha_wait_seconds: int) -> Dict[str, Any]:
+def extract_maps_place_with_retry(driver: webdriver.Chrome, url: str, city: str, name_hint: str, status: Any, should_stop: Optional[Any] = None) -> Dict[str, Any]:
     """Retry one transient Maps page-load failure; CAPTCHA remains manual."""
     last_error: Optional[Exception] = None
     for attempt in range(2):
@@ -255,7 +253,7 @@ def extract_maps_place_with_retry(driver: webdriver.Chrome, url: str, city: str,
             place = extract_maps_place(driver, url, city, name_hint)
             if place["Practice name"] != "N/A": return place
             if captcha_is_visible(driver):
-                wait_for_manual_captcha(driver, status, captcha_wait_seconds)
+                wait_for_manual_captcha(driver, status, should_stop)
             if attempt == 0:
                 status(f"{city}: Maps chưa hiện tên địa điểm, tải lại một lần…")
                 continue
@@ -263,17 +261,18 @@ def extract_maps_place_with_retry(driver: webdriver.Chrome, url: str, city: str,
         except (TimeoutException, WebDriverException) as exc:
             last_error = exc
             if captcha_is_visible(driver):
-                wait_for_manual_captcha(driver, status, captcha_wait_seconds)
+                if not wait_for_manual_captcha(driver, status, should_stop):
+                    raise last_error or exc
             if attempt == 0:
                 status(f"{city}: lỗi tải Maps tạm thời, thử lại địa điểm này một lần…")
                 time.sleep(1)
     raise last_error or WebDriverException("Could not load Google Maps place")
 
-def _google_ai_overview_once(driver: webdriver.Chrome, name: str, city: str, state: str, status: Any, captcha_wait_seconds: int) -> str:
+def _google_ai_overview_once(driver: webdriver.Chrome, name: str, city: str, state: str, status: Any, should_stop: Optional[Any] = None) -> str:
     """Use one focused AI Mode request to gather every lead-screening fact."""
     query = f'"{name}" {city} {state} briefly list owner, hours, private/nonprofit/government status, therapist count, locations, services including IOP, addiction, medication management, case management, peer support, medical treatment, solo/collective, board, 25+ years, MD/DO/PMHNP'
     driver.get(f"https://www.google.com/search?udm=50&q={quote_plus(query)}"); time.sleep(2.2); maybe_accept_google_consent(driver)
-    if not wait_for_manual_captcha(driver, status, captcha_wait_seconds): return ""
+    if not wait_for_manual_captcha(driver, status, should_stop): return ""
     # `udm=50` is Google Search's AI Mode surface. Streaming answers can exceed
     # the old 15-second timeout, and a partially rendered answer can already be
     # longer than a sentence. Require the cleaned answer to stop changing for a
@@ -311,10 +310,11 @@ def _google_ai_overview_once(driver: webdriver.Chrome, name: str, city: str, sta
         time.sleep(0.5)
     return ""
 
-def google_ai_overview(driver: webdriver.Chrome, name: str, city: str, state: str, status: Any, captcha_wait_seconds: int) -> str:
+def google_ai_overview(driver: webdriver.Chrome, name: str, city: str, state: str, status: Any, should_stop: Optional[Any] = None) -> str:
     """Retry once when AI Mode is loading or explicitly has no answer."""
     for attempt in range(AI_MODE_MAX_ATTEMPTS):
-        evidence = _google_ai_overview_once(driver, name, city, state, status, captcha_wait_seconds)
+        evidence = _google_ai_overview_once(driver, name, city, state, status, should_stop)
+        if should_stop and should_stop(): return ""
         if evidence: return evidence
         if attempt < AI_MODE_MAX_ATTEMPTS - 1:
             status(f"{name}: AI Mode chưa có câu trả lời hợp lệ, đang chạy lại clinic này một lần…")
@@ -541,16 +541,22 @@ def new_workbook(rows_by_sheet: Dict[str, pd.DataFrame]) -> bytes:
         for sheet, rows in rows_by_sheet.items(): rows.to_excel(writer, sheet_name=sheet, index=False)
     return output.getvalue()
 
-def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit: int, known: set, progress: Any, gemini_api_key: str = "", captcha_wait_seconds: int = 300, on_accept: Optional[Any] = None, should_stop: Optional[Any] = None, known_lock: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    accepted: List[Dict[str, Any]] = []; debug: List[Dict[str, Any]] = []; places = maps_search_urls(driver, city, state, keyword, limit, progress, captcha_wait_seconds)
+def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit: int, known: set, progress: Any, gemini_api_key: str = "", on_accept: Optional[Any] = None, on_debug: Optional[Any] = None, should_stop: Optional[Any] = None, known_lock: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    accepted: List[Dict[str, Any]] = []; debug: List[Dict[str, Any]] = []
+    def record_debug(item: Dict[str, Any]) -> None:
+        debug.append(item)
+        if on_debug: on_debug(dict(item))
+    places = maps_search_urls(driver, city, state, keyword, limit, progress, should_stop)
     for position, (url, name_hint) in enumerate(places, 1):
         if should_stop and should_stop(): break
         progress(f"{city}: {keyword} — {position}/{len(places)}")
         row: Optional[Dict[str, Any]] = None
         try:
-            row = extract_maps_place_with_retry(driver, url, city, name_hint, progress, captcha_wait_seconds); key = lead_key(row["Practice name"], row["location"])
+            row = extract_maps_place_with_retry(driver, url, city, name_hint, progress, should_stop)
+            if should_stop and should_stop(): break
+            key = lead_key(row["Practice name"], row["location"])
             if row["Practice name"] == "N/A":
-                debug.append({"Practice": "N/A", "Keep": False, "Filter result": "SKIP: không đọc được tên từ Google Maps", "Owner": "N/A", "Operation Time": "N/A", "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "N/A", "Gemini": "not called", "Reasons": "Google Maps listing could not be read"})
+                record_debug({"Practice": "N/A", "Keep": False, "Filter result": "SKIP: không đọc được tên từ Google Maps", "Owner": "N/A", "Operation Time": "N/A", "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "N/A", "Gemini": "not called", "Reasons": "Google Maps listing could not be read"})
                 continue
             if known_lock:
                 with known_lock:
@@ -559,7 +565,8 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
             elif key in known:
                 # Duplicate leads are deliberately skipped without cluttering Debug.
                 continue
-            ai_mode_evidence = google_ai_overview(driver, row["Practice name"], city, state, progress, captcha_wait_seconds)
+            ai_mode_evidence = google_ai_overview(driver, row["Practice name"], city, state, progress, should_stop)
+            if should_stop and should_stop(): break
             if not ai_mode_evidence:
                 # Never ask Gemini to decide from Maps alone when the required AI
                 # Mode evidence is missing or still streaming. Let another keyword
@@ -569,21 +576,21 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                         known.discard(key)
                 else:
                     known.discard(key)
-                debug.append({"Practice": row["Practice name"], "Keep": False, "Filter result": "RETRY: AI Mode chưa hoàn tất", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "", "Gemini": "not called", "Reasons": "AI Mode did not produce a complete stable answer after retries"})
+                record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": "RETRY: AI Mode chưa hoàn tất", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "", "Gemini": "not called", "Reasons": "AI Mode did not produce a complete stable answer after retries"})
                 continue
             overview = f"AI MODE (structured clinic screening query):\n{ai_mode_evidence}"
             metadata = gemini_metadata(gemini_api_key, row, overview); e = merge_gemini_evidence(Evidence(), metadata); v = evidence_as_verification(e); row["Owner's name"] = e.owner
             gemini_hours = metadata.get("operation_time_and_days", "N/A")
             if metadata.get("status") == "ok" and gemini_hours != "N/A": row["operation time and days"] = gemini_hours
             keep = should_keep_in_final_output(v)
-            debug.append({"Practice": row["Practice name"], "Keep": keep, "Filter result": filter_result(v), "Owner": e.owner, "Operation Time": row["operation time and days"], "Therapists": str(e.doctor_count) if e.doctor_count is not None else "UNKNOWN", "Private practice": "YES" if e.private_practice is True else ("NO" if e.private_practice is False else "UNKNOWN"), "Target services": "YES" if e.target_service is True else ("NO" if e.target_service is False else "UNKNOWN"), "AI Mode evidence": ai_mode_evidence, "Gemini": metadata.get("status"), "Reasons": "; ".join(e.red_flags) or "eligible / insufficient evidence", "_export_row": dict(row)})
             if not known_lock: known.add(key)
             if keep:
                 accepted.append(row)
                 if on_accept: on_accept(row)
+            record_debug({"Practice": row["Practice name"], "Keep": keep, "Filter result": filter_result(v), "Owner": e.owner, "Operation Time": row["operation time and days"], "Therapists": str(e.doctor_count) if e.doctor_count is not None else "UNKNOWN", "Private practice": "YES" if e.private_practice is True else ("NO" if e.private_practice is False else "UNKNOWN"), "Target services": "YES" if e.target_service is True else ("NO" if e.target_service is False else "UNKNOWN"), "AI Mode evidence": ai_mode_evidence, "Gemini": metadata.get("status"), "Reasons": "; ".join(e.red_flags) or "eligible / insufficient evidence", "_export_row": dict(row)})
         except (TimeoutException, WebDriverException) as exc:
             practice = row.get("Practice name", "N/A") if row else "N/A"
-            debug.append({"Practice": practice, "Keep": False, "Filter result": f"Google UI error after retry: {type(exc).__name__}", "Owner": "N/A", "Operation Time": row.get("operation time and days", "N/A") if row else "N/A", "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "N/A", "Gemini": "not called", "Reasons": f"Google UI error: {type(exc).__name__}"})
+            record_debug({"Practice": practice, "Keep": False, "Filter result": f"Google UI error after retry: {type(exc).__name__}", "Owner": "N/A", "Operation Time": row.get("operation time and days", "N/A") if row else "N/A", "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "N/A", "Gemini": "not called", "Reasons": f"Google UI error: {type(exc).__name__}"})
     return accepted, debug
 
 def checkpoint_output(source: bytes, rows_by_sheet: Dict[str, List[Dict[str, Any]]]) -> bytes:
@@ -726,7 +733,7 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                                 job["captcha_active"] = any(job["captcha_workers"].values())
                                 if not job["captcha_active"]:
                                     job["captcha_notified"] = False; job["captcha_sound_played"] = False
-                                elif job.get("captcha_notifications") and not job["captcha_sound_played"]:
+                                elif not job["captcha_sound_played"]:
                                     job["captcha_sound_played"] = True
                                     if winsound:
                                         threading.Thread(target=lambda: winsound.MessageBeep(winsound.MB_ICONEXCLAMATION), daemon=True).start()
@@ -735,15 +742,15 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                             with job["lock"]:
                                 job["rows_by_sheet"][target_sheet].append(row)
                                 save_checkpoint_locked(job)
-                                job["message"] = f"Đã lưu checkpoint: {sum(len(x) for x in job['rows_by_sheet'].values())} lead mới."
-                        _, details = run_job(driver, city, state, keyword, job["limit"], job["known"], progress, job["gemini_api_key"], job["captcha_wait_seconds"], on_accept, job["stop_event"].is_set, job["known_lock"])
-                        with job["lock"]:
-                            for item in details:
+                                job["message"] = f"Đã tự động lưu: {sum(len(x) for x in job['rows_by_sheet'].values())} lead mới."
+                        def on_debug(item: Dict[str, Any], target_sheet: str = sheet) -> None:
+                            with job["lock"]:
                                 export_row = item.pop("_export_row", None)
                                 if export_row:
-                                    item["Candidate ID"] = candidate_id(sheet, export_row)
+                                    item["Candidate ID"] = candidate_id(target_sheet, export_row)
                                     job["candidates"][item["Candidate ID"]] = export_row
-                                job["debug"].append({**item, "Sheet": sheet, "City": city, "State": state})
+                                job["debug"].append({**item, "Sheet": target_sheet, "City": city, "State": state})
+                        run_job(driver, city, state, keyword, job["limit"], job["known"], progress, job["gemini_api_key"], on_accept, on_debug, job["stop_event"].is_set, job["known_lock"])
                     except Exception as exc:
                         with job["lock"]:
                             job["debug"].append({"Practice": "N/A", "Keep": False, "Filter result": f"Chrome worker error: {type(exc).__name__}", "Reasons": str(exc), "Sheet": sheet, "City": city, "State": state})
@@ -810,7 +817,7 @@ def _render_background_job(job: Dict[str, Any]) -> None:
         stop_requested = job["stop_event"].is_set()
         bytes_now = job["checkpoint_bytes"]
         summary = pd.DataFrame([{"Sheet": sheet, "Lead mới đã lưu": len(rows)} for sheet, rows in job["rows_by_sheet"].items()])
-        debug = list(job["debug"]); notify = bool(job.get("captcha_notifications")) and job["captcha_active"] and not job["captcha_notified"]
+        debug = list(job["debug"]); notify = job["captcha_active"] and not job["captcha_notified"]
         if notify: job["captcha_notified"] = True
     st.info(message)
     if notify:
@@ -822,7 +829,7 @@ def _render_background_job(job: Dict[str, Any]) -> None:
             o.connect(g); g.connect(c.destination); o.frequency.value = 880; g.gain.value = 0.08; o.start(); setTimeout(() => { o.stop(); c.close(); }, 450);
           } catch (_) {} </script>""", height=0)
     if error: st.error(error)
-    if running and st.button("Dừng và lưu checkpoint ngay", type="secondary"):
+    if running and st.button("Dừng và lưu kết quả ngay", type="secondary"):
         job["stop_event"].set(); stop_requested = True; st.warning("Đã gửi yêu cầu dừng. App sẽ lưu xong lead đang xử lý rồi dừng.")
     if running and stop_requested:
         if st.button("Quay lại màn hình chính ngay", type="secondary", key="return_while_stopping"):
@@ -848,7 +855,7 @@ def _render_background_job(job: Dict[str, Any]) -> None:
             if apply_debug_keep_selection(job, edited_debug):
                 st.success("Đã lưu lựa chọn vào checkpoint. Các dòng mới trong file Excel upload sẽ được tô vàng.")
     if running:
-        st.caption("Trạng thái và bảng debug tự cập nhật mỗi 3 giây; bạn vẫn có thể tải checkpoint hoặc dừng bất cứ lúc nào.")
+        st.caption("Kết quả được lưu sau mỗi lead đạt yêu cầu; trạng thái và bảng kiểm tra tự cập nhật mỗi 3 giây.")
     else:
         st.success("Lượt chạy đã kết thúc. File checkpoint phía trên là file kết quả.")
         st.divider()
@@ -927,8 +934,6 @@ def main() -> None:
         st.caption("Các giá trị mặc định đã phù hợp cho hầu hết trường hợp.")
         keywords = st.text_area("Từ khoá tìm kiếm (mỗi dòng một từ khoá)", "counseling center\nmental health clinic\ntherapy practice")
         limit = st.number_input("Số kết quả tối đa cho mỗi từ khoá", 1, 200, 100)
-        captcha_wait_seconds = st.number_input("Thời gian chờ xác minh CAPTCHA (giây)", min_value=30, max_value=900, value=300, step=30, help="Khi Google yêu cầu xác minh, app sẽ chờ bạn giải CAPTCHA trong khoảng thời gian này.")
-        captcha_notifications = st.checkbox("Thông báo khi cần xác minh CAPTCHA", value=True)
     source = upload.getvalue() if upload else b""
     detected = discover_city_sheets(source, state) if source else []
     selected_sheets: List[str] = []
@@ -969,7 +974,7 @@ def main() -> None:
     st.session_state["scrape_job"] = start_background_job({
         "source": source, "jobs": jobs, "keywords": [x.strip() for x in keywords.splitlines() if x.strip()],
         "limit": int(limit), "parallel_workers": 1, "headless": False, "known": existing_lead_keys(source) if source else set(),
-        "gemini_api_key": gemini_api_key, "captcha_wait_seconds": int(captcha_wait_seconds), "captcha_notifications": captcha_notifications,
+        "gemini_api_key": gemini_api_key,
     })
     st.rerun()
 
