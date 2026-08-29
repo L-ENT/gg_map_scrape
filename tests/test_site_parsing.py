@@ -47,7 +47,11 @@ def test_incomplete_ai_mode_is_not_sent_to_gemini(monkeypatch):
     }
     monkeypatch.setattr("app.maps_search_urls", lambda *args, **kwargs: [("https://maps.test/place", "Incomplete Clinic")])
     monkeypatch.setattr("app.extract_maps_place_with_retry", lambda *args, **kwargs: dict(row))
-    monkeypatch.setattr("app.google_ai_overview", lambda *args, **kwargs: "")
+    ai_calls = []
+    def incomplete_ai(*args, **kwargs):
+        ai_calls.append(True)
+        return ""
+    monkeypatch.setattr("app.google_ai_overview", incomplete_ai)
 
     def unexpected_gemini_call(*args, **kwargs):
         raise AssertionError("Gemini must not be called without complete AI Mode evidence")
@@ -60,6 +64,36 @@ def test_incomplete_ai_mode_is_not_sent_to_gemini(monkeypatch):
     assert debug[0]["Filter result"] == "RETRY: AI Mode chưa hoàn tất"
     assert debug[0]["Gemini"] == "not called"
     assert ("incomplete clinic", "provo") not in known
+    assert len(ai_calls) == 2
+
+
+def test_ai_mode_failure_is_retried_after_the_main_list(monkeypatch):
+    rows = {
+        "First Clinic": {"Practice name": "First Clinic", "location": "Provo", "operation time and days": "N/A"},
+        "Second Clinic": {"Practice name": "Second Clinic", "location": "Provo", "operation time and days": "N/A"},
+    }
+    monkeypatch.setattr("app.maps_search_urls", lambda *args, **kwargs: [("first", "First Clinic"), ("second", "Second Clinic")])
+    monkeypatch.setattr("app.extract_maps_place_with_retry", lambda driver, url, city, name, *args: dict(rows[name]))
+    ai_order = []
+    def ai_result(driver, name, *args, **kwargs):
+        ai_order.append(name)
+        if name == "First Clinic" and ai_order.count(name) == 1:
+            return ""
+        return "Complete AI Mode evidence " * 20
+    monkeypatch.setattr("app.google_ai_overview", ai_result)
+    monkeypatch.setattr("app.gemini_metadata", lambda *args, **kwargs: {
+        "status": "ok", "owner": "N/A", "operation_time_and_days": "N/A",
+        "doctor_count": 2, "branch_count": 1, "is_solo": False,
+        "is_collective": False, "nonprofit": False, "private_practice": True,
+        "target_service": True, "red_flags": [], "disallowed_provider_title": False,
+        "outdated_or_insufficient": False, "over_25_years": False, "has_board": False,
+    })
+
+    accepted, debug = run_job(object(), "Provo", "UT", "therapy", 10, set(), lambda message: None, "api-key")
+
+    assert ai_order == ["First Clinic", "Second Clinic", "First Clinic"]
+    assert {row["Practice name"] for row in accepted} == {"First Clinic", "Second Clinic"}
+    assert all(item["Filter result"] != "RETRY: AI Mode chưa hoàn tất" for item in debug)
 
 
 def test_captcha_wait_can_be_stopped_without_a_timeout(monkeypatch):

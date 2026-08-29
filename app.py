@@ -547,12 +547,19 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
         debug.append(item)
         if on_debug: on_debug(dict(item))
     places = maps_search_urls(driver, city, state, keyword, limit, progress, should_stop)
-    for position, (url, name_hint) in enumerate(places, 1):
+    # Each AI Mode call already retries immediately. Only after both attempts
+    # fail do we append the clinic to the end of this keyword's work list, so
+    # Google gets time to recover while the remaining clinics are processed.
+    work_items = [(url, name_hint, None, False) for url, name_hint in places]
+    for position, (url, name_hint, saved_row, deferred_retry) in enumerate(work_items, 1):
         if should_stop and should_stop(): break
-        progress(f"{city}: {keyword} — {position}/{len(places)}")
+        if deferred_retry:
+            progress(f"{city}: đang thử lại AI Mode cuối lượt cho {name_hint}…")
+        else:
+            progress(f"{city}: {keyword} — {position}/{len(places)}")
         row: Optional[Dict[str, Any]] = None
         try:
-            row = extract_maps_place_with_retry(driver, url, city, name_hint, progress, should_stop)
+            row = dict(saved_row) if saved_row is not None else extract_maps_place_with_retry(driver, url, city, name_hint, progress, should_stop)
             if should_stop and should_stop(): break
             key = lead_key(row["Practice name"], row["location"])
             if row["Practice name"] == "N/A":
@@ -576,6 +583,10 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                         known.discard(key)
                 else:
                     known.discard(key)
+                if not deferred_retry:
+                    work_items.append((url, row["Practice name"], dict(row), True))
+                    progress(f"{row['Practice name']}: hai lần thử AI Mode chưa thành công; đã đưa vào danh sách chờ cuối lượt.")
+                    continue
                 record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": "RETRY: AI Mode chưa hoàn tất", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "", "Gemini": "not called", "Reasons": "AI Mode did not produce a complete stable answer after retries"})
                 continue
             overview = f"AI MODE (structured clinic screening query):\n{ai_mode_evidence}"
