@@ -889,7 +889,9 @@ def apply_debug_keep_selection(job: Dict[str, Any], edited_debug: pd.DataFrame) 
     changed = 0
     with job["lock"]:
         for _, debug_row in edited_debug.iterrows():
-            selected = bool(debug_row.get("Keep", False)); item_id = normalize_text(debug_row.get("Candidate ID", ""))
+            selected = bool(debug_row.get("Keep", False))
+            raw_item_id = debug_row.get("Candidate ID", "")
+            item_id = "" if pd.isna(raw_item_id) else str(raw_item_id).strip()
             # Some Streamlit versions omit columns hidden through column_config
             # from the edited dataframe. STT is visible and stable, so use it to
             # recover the internal candidate id instead of silently ignoring the
@@ -898,7 +900,7 @@ def apply_debug_keep_selection(job: Dict[str, Any], edited_debug: pd.DataFrame) 
                 try: position = int(debug_row.get("STT", 0)) - 1
                 except (TypeError, ValueError): position = -1
                 if 0 <= position < len(job["debug"]):
-                    item_id = normalize_text(job["debug"][position].get("Candidate ID", ""))
+                    item_id = str(job["debug"][position].get("Candidate ID", "") or "").strip()
             candidate = job["candidates"].get(item_id)
             if not candidate: continue
             sheet = normalize_text(debug_row.get("Sheet", ""))
