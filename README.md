@@ -7,7 +7,7 @@
 3. Đối tác mở `Clinic Lead Collector.exe`. Lần đầu Windows có thể hỏi quyền tường lửa cho máy chủ cục bộ; chọn Allow.
 4. Google Chrome phải được cài sẵn. Chrome được mở hiển thị để người dùng tự xác minh CAPTCHA khi Google yêu cầu.
 
-Checkpoint Excel được lưu dưới `%LOCALAPPDATA%\ClinicLeadCollector\checkpoints` và có thể tải ngay trong app. Cache Maps, AI Mode và Gemini được lưu trong `%LOCALAPPDATA%\ClinicLeadCollector\clinic_cache.sqlite` để các lượt sau không phân tích lại cùng một phòng khám. API key không được ghi vào cache. Khi chạy, app có thể mở hai cửa sổ Chrome để thu thập song song; Gemini vẫn được xử lý qua một hàng đợi tuần tự để tôn trọng rate limit.
+Checkpoint Excel được lưu dưới `%LOCALAPPDATA%\ClinicLeadCollector\checkpoints` và có thể tải ngay trong app. Cache Maps, AI Mode và Gemini được lưu trong `%LOCALAPPDATA%\ClinicLeadCollector\clinic_cache.sqlite` để các lượt sau không phân tích lại cùng một phòng khám. API key không được ghi vào cache. Khi chạy, app mở hai cửa sổ Chrome dùng chung một hàng đợi phòng khám: cửa sổ nào xong trước sẽ lấy lead tiếp theo. Gemini vẫn được xử lý qua một hàng đợi tuần tự để tôn trọng rate limit. Nếu key hết quota, app phát thông báo và cho nhập key khác để tiếp tục mà không chạy lại Maps hoặc AI Mode.
 
 App chạy hoàn toàn local; Internet chỉ được dùng cho Google Maps, Google AI Mode, Gemini và kiểm tra bản cập nhật.
 

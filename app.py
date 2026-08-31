@@ -158,6 +158,34 @@ class ClinicCache:
         except (ValueError, TypeError): result["gemini"] = None
         return result
 
+    def completed_for_city(self, city: str) -> List[Dict[str, Any]]:
+        """Return current, fully analyzed cache entries for one search city."""
+        normalized_city = normalize_text(city).casefold()
+        if not normalized_city:
+            return []
+        cutoff = time.time() - CACHE_TTL_DAYS * 86400
+        with self._connect() as connection:
+            records = connection.execute(
+                """
+                SELECT * FROM clinic_cache
+                WHERE city = ? AND updated_at >= ? AND gemini_status = 'ok'
+                  AND prompt_version = ? AND rule_version = ?
+                ORDER BY updated_at DESC
+                """,
+                (normalized_city, cutoff, CACHE_PROMPT_VERSION, CACHE_RULE_VERSION),
+            ).fetchall()
+        completed = []
+        for record in records:
+            result = dict(record)
+            try:
+                result["maps"] = json.loads(result.pop("maps_json"))
+                result["gemini"] = json.loads(result.pop("gemini_json"))
+            except (ValueError, TypeError):
+                continue
+            if result["maps"] and result["gemini"]:
+                completed.append(result)
+        return completed
+
     def save(self, row: Dict[str, Any], ai_evidence: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
         existing = self.lookup(row) or {}
         place_id, name, phone, domain = self._lookup_values(row)
@@ -189,6 +217,12 @@ class Evidence:
 
 def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+def format_elapsed_time(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 def normalize_website(value: str) -> str:
     value = normalize_text(value)
@@ -782,16 +816,16 @@ def new_workbook(rows_by_sheet: Dict[str, pd.DataFrame]) -> bytes:
         for sheet, rows in rows_by_sheet.items(): rows.to_excel(writer, sheet_name=sheet, index=False)
     return output.getvalue()
 
-def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit: int, known: set, progress: Any, gemini_api_key: str = "", on_debug: Optional[Any] = None, on_candidate_progress: Optional[Any] = None, on_retry_waiting: Optional[Any] = None, should_stop: Optional[Any] = None, known_lock: Optional[Any] = None, cache: Optional[ClinicCache] = None, on_ai_ready: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit: int, known: set, progress: Any, gemini_api_key: str = "", on_debug: Optional[Any] = None, on_candidate_progress: Optional[Any] = None, on_retry_waiting: Optional[Any] = None, should_stop: Optional[Any] = None, known_lock: Optional[Any] = None, cache: Optional[ClinicCache] = None, on_ai_ready: Optional[Any] = None, place_work_items: Optional[List[Tuple[str, str, Optional[Dict[str, Any]], bool]]] = None, on_deferred_retry: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     accepted: List[Dict[str, Any]] = []; debug: List[Dict[str, Any]] = []
     def record_debug(item: Dict[str, Any]) -> None:
         debug.append(item)
         if on_debug: on_debug(dict(item))
-    places = maps_search_urls(driver, city, state, keyword, limit, progress, should_stop)
+    places = maps_search_urls(driver, city, state, keyword, limit, progress, should_stop) if place_work_items is None else [(url, name_hint) for url, name_hint, _, _ in place_work_items]
     # Each AI Mode call already retries immediately. Only after both attempts
     # fail do we append the clinic to the end of this keyword's work list, so
     # Google gets time to recover while the remaining clinics are processed.
-    work_items = [(url, name_hint, None, False) for url, name_hint in places]
+    work_items = [(url, name_hint, None, False) for url, name_hint in places] if place_work_items is None else list(place_work_items)
     for position, (url, name_hint, saved_row, deferred_retry) in enumerate(work_items, 1):
         if should_stop and should_stop(): break
         if deferred_retry:
@@ -867,8 +901,11 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                 else:
                     known.difference_update(reserved_keys)
                 if not deferred_retry:
-                    work_items.append((url, row["Practice name"], dict(row), True))
                     if on_retry_waiting: on_retry_waiting(1)
+                    if on_deferred_retry:
+                        on_deferred_retry(url, row["Practice name"], dict(row))
+                    else:
+                        work_items.append((url, row["Practice name"], dict(row), True))
                     progress(f"{row['Practice name']}: hai lần thử AI Mode chưa thành công; đã đưa vào danh sách chờ cuối lượt.")
                     continue
                 record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": "RETRY: AI Mode chưa hoàn tất", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "", "Gemini": "not called", "Reasons": "AI Mode did not produce a complete stable answer after retries"})
@@ -1017,22 +1054,77 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
     job: Dict[str, Any] = {
         **config, "lock": threading.Lock(), "stop_event": threading.Event(), "running": True,
         "message": "Đang chuẩn bị…", "error": "",
-        "known_lock": threading.Lock(), "captcha_workers": {},
+        "started_at": time.monotonic(), "finished_at": None,
+        "known_lock": threading.Lock(), "captcha_workers": {}, "progress_label": "nhóm tìm kiếm",
         "task_total": len(config["jobs"]) * len(config["keywords"]),
         "tasks_completed": 0, "task_progress": {}, "retry_waiting": 0, "gemini_pending": 0, "cache_hits": 0,
         "rows_by_sheet": {sheet: [] for _, _, sheet in config["jobs"]}, "debug": [], "candidates": {},
         "checkpoint_path": str(checkpoint_dir / f"clinic_leads_checkpoint_{uuid.uuid4().hex[:8]}.xlsx"),
         "checkpoint_bytes": b"", "captcha_active": False, "captcha_notified": False, "captcha_sound_played": False,
+        "gemini_key_required": False, "gemini_key_notified": False, "gemini_key_event": threading.Event(),
     }
+    # A new workbook must not lose clinics that were already fully analyzed in
+    # an earlier run. Restore current KEEP results for the requested cities, but
+    # never add a row whose identity is already present in the uploaded Excel.
+    restored_keys = set(job["known"])
+    restored_count = 0
+    restored_targets = set()
+    for city, state, sheet in job["jobs"]:
+        target = (normalize_text(city).casefold(), sheet.casefold())
+        if target in restored_targets:
+            continue
+        restored_targets.add(target)
+        for cached in cache.completed_for_city(city):
+            row, keep, debug_item = candidate_result(cached["maps"], cached.get("ai_evidence", ""), cached["gemini"])
+            identity_keys = lead_identity_keys(row)
+            if not keep or not identity_keys or identity_keys & restored_keys:
+                continue
+            restored_keys.update(identity_keys)
+            job["known"].update(identity_keys)
+            job["rows_by_sheet"][sheet].append(row)
+            export_row = debug_item.pop("_export_row", row)
+            item_id = candidate_id(sheet, export_row)
+            debug_item["Candidate ID"] = item_id
+            debug_item["Filter result"] = "KEEP: restored from cache"
+            debug_item["Reasons"] = "Previously verified Maps + AI Mode + Gemini result"
+            job["candidates"][item_id] = export_row
+            job["debug"].append({**debug_item, "Sheet": sheet, "City": city, "State": state})
+            restored_count += 1
+    job["cache_hits"] = restored_count
+    if restored_count:
+        job["message"] = f"Đã khôi phục {restored_count} lead đạt yêu cầu từ cache; đang chuẩn bị tìm lead mới…"
     with job["lock"]:
         save_checkpoint_locked(job)
     def worker() -> None:
-        tasks: Queue = Queue()
+        search_tasks: Queue = Queue()
+        clinic_tasks: Queue = Queue()
         gemini_tasks: Queue = Queue()
         for city, state, sheet in job["jobs"]:
             for keyword in job["keywords"]:
-                tasks.put((city, state, sheet, keyword))
-        worker_count = min(max(1, int(job.get("parallel_workers", 1))), 5, tasks.qsize() or 1)
+                search_tasks.put((city, state, sheet, keyword))
+        # Keep both requested browsers available even when there is only one
+        # city/keyword search group; after discovery they share its clinics.
+        worker_count = min(max(1, int(job.get("parallel_workers", 1))), 5)
+        discovery_done = threading.Event()
+        discovery_state = {"remaining": worker_count}
+        discovery_state_lock = threading.Lock()
+        discovered_urls = set()
+        discovered_urls_lock = threading.Lock()
+
+        def finish_discovery() -> None:
+            with job["lock"]:
+                job["tasks_completed"] = 0
+                job["task_progress"].clear()
+                job["task_total"] = max(1, clinic_tasks.qsize())
+                job["progress_label"] = "phòng khám"
+                job["message"] = f"Đã tìm thấy {clinic_tasks.qsize()} kết quả Maps; hai Chrome đang chia nhau từng phòng khám."
+            discovery_done.set()
+
+        def mark_discovery_worker_done() -> None:
+            with discovery_state_lock:
+                discovery_state["remaining"] -= 1
+                if discovery_state["remaining"] == 0:
+                    finish_discovery()
 
         def append_accepted(row: Dict[str, Any], sheet: str) -> None:
             with job["lock"]:
@@ -1071,6 +1163,21 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
             with job["lock"]:
                 job["gemini_pending"] = max(0, job["gemini_pending"] - 1)
 
+        def request_gemini_with_key_replacement(item: Dict[str, Any], overview: str, requested_fields: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+            """Pause only Gemini when a key reaches quota; Chrome may keep collecting."""
+            while not job["stop_event"].is_set():
+                metadata = gemini_metadata(job["gemini_api_key"], item["row"], overview, requested_fields=requested_fields)
+                if metadata.get("status") != "rate_limited":
+                    return metadata
+                with job["lock"]:
+                    job["gemini_key_required"] = True
+                    job["message"] = "Gemini API key đã hết hạn mức. Hãy nhập key mới để tiếp tục; dữ liệu Chrome vẫn được lưu vào hàng đợi."
+                    job["gemini_key_event"].clear()
+                while not job["stop_event"].is_set():
+                    if job["gemini_key_event"].wait(timeout=1):
+                        break
+            return {"status": "stopped"}
+
         def gemini_processor() -> None:
             api_retry: List[Dict[str, Any]] = []
             targeted_retry: List[Tuple[Dict[str, Any], Dict[str, Any], List[str]]] = []
@@ -1084,7 +1191,7 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                         with job["lock"]: job["cache_hits"] += 1
                     else:
                         overview = f"AI MODE (structured clinic screening query):\n{item['ai_evidence']}"
-                        metadata = gemini_metadata(job["gemini_api_key"], item["row"], overview)
+                        metadata = request_gemini_with_key_replacement(item, overview)
                         cache.save(item["row"], ai_evidence=item["ai_evidence"], metadata=metadata)
                     if metadata.get("status") != "ok":
                         api_retry.append(item)
@@ -1104,7 +1211,7 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
             for item, primary, missing in targeted_retry:
                 try:
                     overview = f"AI MODE (structured clinic screening query):\n{item['ai_evidence']}"
-                    targeted = gemini_metadata(job["gemini_api_key"], item["row"], overview, requested_fields=missing)
+                    targeted = request_gemini_with_key_replacement(item, overview, requested_fields=missing)
                     finish_gemini_item(item, merge_targeted_metadata(primary, targeted, missing))
                 except Exception:
                     # The primary extraction is still valid; do not lose it just
@@ -1117,13 +1224,13 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
             for item in api_retry:
                 try:
                     overview = f"AI MODE (structured clinic screening query):\n{item['ai_evidence']}"
-                    metadata = gemini_metadata(job["gemini_api_key"], item["row"], overview)
+                    metadata = request_gemini_with_key_replacement(item, overview)
                     if metadata.get("status") != "ok":
                         mark_gemini_waiting(item, normalize_text(metadata.get("status", "error")))
                     else:
                         missing = important_missing_fields(metadata, item["ai_evidence"])
                         if missing:
-                            targeted = gemini_metadata(job["gemini_api_key"], item["row"], overview, requested_fields=missing)
+                            targeted = request_gemini_with_key_replacement(item, overview, requested_fields=missing)
                             metadata = merge_targeted_metadata(metadata, targeted, missing)
                         finish_gemini_item(item, metadata)
                 except Exception as exc:
@@ -1134,24 +1241,62 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
 
         def browser_worker(worker_number: int) -> None:
             driver: Optional[webdriver.Chrome] = None
+            discovery_marked = False
             try:
                 driver = build_driver(job["headless"])
+                def progress(message: str) -> None:
+                    with job["lock"]:
+                        is_captcha = "CAPTCHA" in message.upper()
+                        job["captcha_workers"][worker_number] = is_captcha
+                        job["captcha_active"] = any(job["captcha_workers"].values())
+                        if not job["captcha_active"]:
+                            job["captcha_notified"] = False; job["captcha_sound_played"] = False
+                        elif not job["captcha_sound_played"]:
+                            job["captcha_sound_played"] = True
+                            if winsound:
+                                threading.Thread(target=lambda: winsound.MessageBeep(winsound.MB_ICONEXCLAMATION), daemon=True).start()
+                        job["message"] = f"Chrome {worker_number}/{worker_count}: {message}"
+
+                # Phase 1: both Chrome windows discover Maps listings. Every
+                # unique listing is placed into one shared clinic queue.
                 while not job["stop_event"].is_set():
-                    try: city, state, sheet, keyword = tasks.get_nowait()
+                    try: city, state, sheet, keyword = search_tasks.get_nowait()
                     except Empty: break
                     try:
-                        def progress(message: str) -> None:
-                            with job["lock"]:
-                                is_captcha = "CAPTCHA" in message.upper()
-                                job["captcha_workers"][worker_number] = is_captcha
-                                job["captcha_active"] = any(job["captcha_workers"].values())
-                                if not job["captcha_active"]:
-                                    job["captcha_notified"] = False; job["captcha_sound_played"] = False
-                                elif not job["captcha_sound_played"]:
-                                    job["captcha_sound_played"] = True
-                                    if winsound:
-                                        threading.Thread(target=lambda: winsound.MessageBeep(winsound.MB_ICONEXCLAMATION), daemon=True).start()
-                                job["message"] = f"Chrome {worker_number}/{worker_count}: {message}"
+                        places = maps_search_urls(driver, city, state, keyword, job["limit"], progress, job["stop_event"].is_set)
+                        for url, name_hint in places:
+                            with discovered_urls_lock:
+                                if url in discovered_urls:
+                                    continue
+                                discovered_urls.add(url)
+                            clinic_tasks.put({
+                                "url": url, "name_hint": name_hint, "saved_row": None, "deferred_retry": False,
+                                "city": city, "state": state, "sheet": sheet, "keyword": keyword,
+                            })
+                    except Exception as exc:
+                        with job["lock"]:
+                            job["debug"].append({"Practice": "N/A", "Keep": False, "Filter result": f"Maps search error: {type(exc).__name__}", "Reasons": str(exc), "Sheet": sheet, "City": city, "State": state})
+                    finally:
+                        with job["lock"]:
+                            job["tasks_completed"] += 1
+                        search_tasks.task_done()
+
+                # Neither browser starts the clinic phase early. This barrier
+                # keeps both windows alive, then lets them pull individual
+                # clinics dynamically so the faster Chrome always gets more work.
+                mark_discovery_worker_done()
+                discovery_marked = True
+                discovery_done.wait()
+
+                # Phase 2: process one clinic at a time from the common queue.
+                while True:
+                    clinic_item = clinic_tasks.get()
+                    if clinic_item is None:
+                        clinic_tasks.task_done()
+                        break
+                    city = clinic_item["city"]; state = clinic_item["state"]
+                    sheet = clinic_item["sheet"]; keyword = clinic_item["keyword"]
+                    try:
                         def on_debug(item: Dict[str, Any], target_sheet: str = sheet) -> None:
                             append_debug(item, target_sheet, city, state)
                         def on_ai_ready(row: Dict[str, Any], ai_evidence: str, cached_metadata: Optional[Dict[str, Any]], target_sheet: str = sheet) -> None:
@@ -1165,12 +1310,24 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                         def on_retry_waiting(delta: int) -> None:
                             with job["lock"]:
                                 job["retry_waiting"] = max(0, job["retry_waiting"] + delta)
+                        def on_deferred_retry(url: str, name_hint: str, saved_row: Dict[str, Any]) -> None:
+                            clinic_tasks.put({
+                                "url": url, "name_hint": name_hint, "saved_row": saved_row, "deferred_retry": True,
+                                "city": city, "state": state, "sheet": sheet, "keyword": keyword,
+                            })
+                            with job["lock"]:
+                                job["task_total"] += 1
                         run_job(
                             driver, city, state, keyword, job["limit"], job["known"], progress, job["gemini_api_key"],
                             on_debug=on_debug,
                             on_candidate_progress=on_candidate_progress, on_retry_waiting=on_retry_waiting,
                             should_stop=job["stop_event"].is_set, known_lock=job["known_lock"],
                             cache=cache, on_ai_ready=on_ai_ready,
+                            place_work_items=[(
+                                clinic_item["url"], clinic_item["name_hint"],
+                                clinic_item["saved_row"], clinic_item["deferred_retry"],
+                            )],
+                            on_deferred_retry=on_deferred_retry,
                         )
                     except Exception as exc:
                         with job["lock"]:
@@ -1179,11 +1336,15 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                         with job["lock"]:
                             job["tasks_completed"] += 1
                             job["task_progress"].pop(worker_number, None)
-                        tasks.task_done()
+                        clinic_tasks.task_done()
+                    if job["stop_event"].is_set():
+                        continue
             except Exception as exc:
                 with job["lock"]:
                     job["error"] = f"Chrome {worker_number}: {type(exc).__name__}: {exc}"
             finally:
+                if not discovery_marked:
+                    mark_discovery_worker_done()
                 if driver:
                     try: driver.quit()
                     except Exception: pass
@@ -1193,6 +1354,10 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
 
         workers = [threading.Thread(target=browser_worker, args=(number,), daemon=True, name=f"clinic-browser-{number}") for number in range(1, worker_count + 1)]
         for browser_thread in workers: browser_thread.start()
+        discovery_done.wait()
+        clinic_tasks.join()
+        for _ in workers: clinic_tasks.put(None)
+        clinic_tasks.join()
         for browser_thread in workers: browser_thread.join()
         gemini_tasks.put(None)
         gemini_tasks.join()
@@ -1209,6 +1374,8 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
         finally:
             with job["lock"]:
                 job["retry_waiting"] = 0
+                job["gemini_key_required"] = False
+                job["finished_at"] = time.monotonic()
                 job["running"] = False
     threading.Thread(target=worker, daemon=True, name="clinic-scraper").start()
     return job
@@ -1270,12 +1437,19 @@ def _render_background_job(job: Dict[str, Any]) -> None:
         retry_waiting = int(job.get("retry_waiting", 0))
         gemini_pending = int(job.get("gemini_pending", 0))
         cache_hits = int(job.get("cache_hits", 0))
+        progress_label = normalize_text(job.get("progress_label", "công việc"))
+        started_at = float(job.get("started_at", time.monotonic()))
+        finished_at = job.get("finished_at")
+        elapsed = format_elapsed_time(float(finished_at or time.monotonic()) - started_at)
+        gemini_key_required = bool(job.get("gemini_key_required"))
+        notify_gemini_key = gemini_key_required and not job.get("gemini_key_notified", False)
         if running and gemini_pending and overall_progress >= 1.0:
             overall_progress = 0.99
         if notify: job["captcha_notified"] = True
+        if notify_gemini_key: job["gemini_key_notified"] = True
     st.info(message)
     progress_percent = round(overall_progress * 100)
-    st.progress(overall_progress, text=f"Tiến độ tổng thể: {progress_percent}% — hoàn tất {tasks_completed}/{task_total} nhóm thành phố × từ khóa")
+    st.progress(overall_progress, text=f"Tiến độ tổng thể: {progress_percent}% — hoàn tất {tasks_completed}/{task_total} {progress_label} — đã chạy {elapsed}")
     checked_col, kept_col, rejected_col, retry_col, cache_col = st.columns(5)
     checked_col.metric("Đã kiểm tra", checked_count)
     kept_col.metric("Giữ lại", kept_count)
@@ -1290,9 +1464,30 @@ def _render_background_job(job: Dict[str, Any]) -> None:
             const c = new (window.AudioContext || window.webkitAudioContext)(); const o = c.createOscillator(); const g = c.createGain();
             o.connect(g); g.connect(c.destination); o.frequency.value = 880; g.gain.value = 0.08; o.start(); setTimeout(() => { o.stop(); c.close(); }, 450);
           } catch (_) {} </script>""", height=0)
+    if gemini_key_required:
+        st.warning("Gemini API key đã hết hạn mức. Hai Chrome vẫn tiếp tục thu thập; hãy nhập key khác để hàng đợi Gemini chạy tiếp.")
+        replacement_key = st.text_input("Gemini API key mới", type="password", key="replacement_gemini_api_key")
+        if st.button("Dùng key mới và tiếp tục", type="primary", key="replace_gemini_key"):
+            if not replacement_key.strip():
+                st.error("Vui lòng nhập Gemini API key mới.")
+            else:
+                with job["lock"]:
+                    job["gemini_api_key"] = replacement_key.strip()
+                    job["gemini_key_required"] = False
+                    job["gemini_key_notified"] = False
+                    job["message"] = "Đã nhận Gemini API key mới; đang tiếp tục xử lý hàng đợi."
+                    job["gemini_key_event"].set()
+                st.rerun()
+    if notify_gemini_key:
+        components.html("""<script>
+          try { if (Notification.permission === 'default') Notification.requestPermission();
+            if (Notification.permission === 'granted') new Notification('Clinic scraper', {body: 'Gemini API key đã hết hạn mức. Hãy nhập key mới để tiếp tục.'});
+            const c = new (window.AudioContext || window.webkitAudioContext)(); const o = c.createOscillator(); const g = c.createGain();
+            o.connect(g); g.connect(c.destination); o.frequency.value = 660; g.gain.value = 0.08; o.start(); setTimeout(() => { o.stop(); c.close(); }, 650);
+          } catch (_) {} </script>""", height=0)
     if error: st.error(error)
     if running and st.button("Dừng và lưu kết quả ngay", type="secondary"):
-        job["stop_event"].set(); stop_requested = True; st.warning("Đã gửi yêu cầu dừng. App sẽ lưu xong lead đang xử lý rồi dừng.")
+        job["stop_event"].set(); job["gemini_key_event"].set(); stop_requested = True; st.warning("Đã gửi yêu cầu dừng. App sẽ lưu xong lead đang xử lý rồi dừng.")
     if running and stop_requested:
         if st.button("Quay lại màn hình chính ngay", type="secondary", key="return_while_stopping"):
             # Keep the worker alive so its checkpoint is still finalized; only

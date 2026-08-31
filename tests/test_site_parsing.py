@@ -21,6 +21,7 @@ from app import (
     early_maps_rejection,
     extract_operation_time_from_text,
     filter_result,
+    format_elapsed_time,
     lead_identity_keys,
     maps_place_id_from_url,
     merge_gemini_evidence,
@@ -36,6 +37,11 @@ from app import (
 def test_extract_operation_time_from_relevant_sentence():
     page_text = "Monday-Friday 9:00 AM - 5:00 PM. We offer counseling services."
     assert extract_operation_time_from_text(page_text) == "Monday-Friday 9:00 AM - 5:00 PM"
+
+
+def test_elapsed_time_uses_fixed_hour_minute_second_format():
+    assert format_elapsed_time(0) == "00:00:00"
+    assert format_elapsed_time(3661.9) == "01:01:01"
 
 
 def test_ai_mode_rejects_streaming_and_short_answers():
@@ -307,6 +313,45 @@ def test_rate_limit_saves_ai_evidence_instead_of_rejecting(monkeypatch, tmp_path
     assert cache.lookup({"maps place id": "ChIJQUOTA"})["ai_evidence"] == "Complete AI Mode evidence"
 
 
+def test_new_workbook_restores_cached_keep_unless_excel_already_has_it(monkeypatch, tmp_path):
+    cache_path = tmp_path / "cache.sqlite"
+    cache = ClinicCache(cache_path)
+    row = {
+        "Practice name": "Restored Clinic", "maps place id": "ChIJRESTORE",
+        "phone number": "8015559090", "website link": "https://restore.example",
+        "location": "Provo", "operation time and days": "N/A", "maps raw text": "Maps evidence",
+    }
+    metadata = {
+        "status": "ok", "owner": "Jane Doe", "owner_role": "Founder",
+        "doctor_count": 1, "branch_count": 1, "target_service": True, "red_flags": [],
+    }
+    cache.save(row, ai_evidence="Complete cached AI evidence", metadata=metadata)
+
+    class FakeDriver:
+        def quit(self): pass
+
+    monkeypatch.setattr("app.checkpoint_directory", lambda: tmp_path)
+    monkeypatch.setattr("app.build_driver", lambda headless: FakeDriver())
+
+    def start(known):
+        job = start_background_job({
+            "source": b"", "jobs": [("Provo", "UT", "Provo, UT")], "keywords": [],
+            "limit": 10, "parallel_workers": 2, "headless": False, "known": set(known),
+            "gemini_api_key": "key", "cache_path": cache_path,
+        })
+        deadline = time.time() + 5
+        while job["running"] and time.time() < deadline:
+            time.sleep(0.01)
+        return job
+
+    restored_job = start(set())
+    existing_job = start(lead_identity_keys(row))
+
+    assert [item["Practice name"] for item in restored_job["rows_by_sheet"]["Provo, UT"]] == ["Restored Clinic"]
+    assert restored_job["debug"][0]["Filter result"] == "KEEP: restored from cache"
+    assert existing_job["rows_by_sheet"]["Provo, UT"] == []
+
+
 def test_two_browser_collectors_feed_one_gemini_thread(monkeypatch, tmp_path):
     browser_threads, result_threads = [], []
     barrier = threading.Barrier(2)
@@ -331,6 +376,7 @@ def test_two_browser_collectors_feed_one_gemini_thread(monkeypatch, tmp_path):
 
     monkeypatch.setattr("app.checkpoint_directory", lambda: tmp_path)
     monkeypatch.setattr("app.build_driver", fake_build_driver)
+    monkeypatch.setattr("app.maps_search_urls", lambda driver, city, state, keyword, limit, progress, should_stop: [(f"https://maps.test/{city}", f"{city} Clinic")])
     monkeypatch.setattr("app.run_job", fake_run_job)
     monkeypatch.setattr("app.candidate_result", tracked_result)
     job = start_background_job({
@@ -345,6 +391,52 @@ def test_two_browser_collectors_feed_one_gemini_thread(monkeypatch, tmp_path):
     assert job["running"] is False
     assert set(browser_threads) == {"clinic-browser-1", "clinic-browser-2"}
     assert result_threads == ["clinic-gemini", "clinic-gemini"]
+
+
+def test_rate_limited_gemini_waits_for_replacement_key(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeDriver:
+        def quit(self): pass
+
+    def fake_run_job(driver, city, state, keyword, limit, known, progress, gemini_api_key, **kwargs):
+        row = {"Practice name": "Key Clinic", "location": city, "operation time and days": "N/A"}
+        kwargs["on_ai_ready"](row, "Complete evidence", None)
+        return [], []
+
+    def fake_gemini(api_key, row, overview, requested_fields=None):
+        calls.append(api_key)
+        if api_key == "exhausted-key":
+            return {"status": "rate_limited"}
+        return {"status": "ok", "owner": "N/A", "doctor_count": 1, "target_service": True, "red_flags": []}
+
+    monkeypatch.setattr("app.checkpoint_directory", lambda: tmp_path)
+    monkeypatch.setattr("app.build_driver", lambda headless: FakeDriver())
+    monkeypatch.setattr("app.maps_search_urls", lambda *args, **kwargs: [("https://maps.test/key", "Key Clinic")])
+    monkeypatch.setattr("app.run_job", fake_run_job)
+    monkeypatch.setattr("app.gemini_metadata", fake_gemini)
+    job = start_background_job({
+        "source": b"", "jobs": [("Provo", "UT", "Provo, UT")], "keywords": ["therapy"],
+        "limit": 10, "parallel_workers": 2, "headless": False, "known": set(),
+        "gemini_api_key": "exhausted-key", "cache_path": tmp_path / "cache.sqlite",
+    })
+    deadline = time.time() + 5
+    while not job["gemini_key_required"] and time.time() < deadline:
+        time.sleep(0.01)
+    assert job["running"] is True
+    assert job["gemini_key_required"] is True
+
+    with job["lock"]:
+        job["gemini_api_key"] = "replacement-key"
+        job["gemini_key_required"] = False
+        job["gemini_key_event"].set()
+    deadline = time.time() + 5
+    while job["running"] and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert calls == ["exhausted-key", "replacement-key"]
+    assert job["running"] is False
+    assert [row["Practice name"] for row in job["rows_by_sheet"]["Provo, UT"]] == ["Key Clinic"]
 
 
 def test_append_rows_preserves_existing_data_and_adds_missing_columns():
