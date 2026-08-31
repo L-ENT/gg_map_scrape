@@ -39,7 +39,7 @@ except ImportError:
     winsound = None
 
 st.set_page_config(page_title="Google Maps AI Overview clinic leads", page_icon="🗺️", layout="wide")
-MAX_DOCTOR_COUNT, MAX_BRANCH_COUNT = 35, 5
+MAX_THERAPIST_COUNT, MAX_BRANCH_COUNT = 60, 5
 # Always give the Maps result feed a meaningful chance to load.  After the
 # minimum number of scrolls, stop only if it has remained unchanged for this
 # many more passes (or Google explicitly says the list has ended).
@@ -123,7 +123,7 @@ def filter_result(v: Dict[str, Any]) -> str:
         reasons.append("solo practitioner with 25+ years experience")
     if v.get("is_therapist_collective_or_independent") is True and v.get("Has_Direct_Therapist_Phone") is not True:
         reasons.append("therapist collective without direct therapist phone")
-    if isinstance(v.get("doctor_count"), (int, float)) and v["doctor_count"] >= MAX_DOCTOR_COUNT: reasons.append(f"{MAX_DOCTOR_COUNT}+ therapists")
+    if isinstance(v.get("doctor_count"), (int, float)) and v["doctor_count"] > MAX_THERAPIST_COUNT: reasons.append(f">{MAX_THERAPIST_COUNT} therapists")
     if isinstance(v.get("branch_count"), (int, float)) and v["branch_count"] > MAX_BRANCH_COUNT: reasons.append(f">{MAX_BRANCH_COUNT} locations")
     if reasons:
         return "REJECT: " + "; ".join(reasons)

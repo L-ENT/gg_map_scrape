@@ -194,11 +194,12 @@ def test_direct_therapist_phone_is_propagated_to_filter_evidence():
     assert evidence.direct_therapist_phone is True
 
 
-def test_size_limits_are_unchanged():
+def test_rejects_only_above_sixty_therapists_or_five_locations():
     qualifying = {"Contains_Target_Services_Licenses": True}
-    assert filter_result({**qualifying, "doctor_count": 35}) == "REJECT: 35+ therapists"
+    assert filter_result({**qualifying, "doctor_count": 60}) == "KEEP"
+    assert filter_result({**qualifying, "doctor_count": 61}) == "REJECT: >60 therapists"
+    assert filter_result({**qualifying, "branch_count": 5}) == "KEEP"
     assert filter_result({**qualifying, "branch_count": 6}) == "REJECT: >5 locations"
-    assert filter_result({**qualifying, "doctor_count": 34, "branch_count": 5}) == "KEEP"
 
 
 def test_owner_role_must_explicitly_prove_ownership():
