@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -45,6 +46,9 @@ MAX_THERAPIST_COUNT, MAX_BRANCH_COUNT = 60, 5
 # many more passes (or Google explicitly says the list has ended).
 MIN_MAPS_SCROLL_ROUNDS, MAPS_STALL_ROUNDS = 20, 20
 MAX_SAVED_CHECKPOINTS = 10
+CACHE_TTL_DAYS = 30
+CACHE_PROMPT_VERSION = 1
+CACHE_RULE_VERSION = 1
 GEMINI_MIN_REQUEST_INTERVAL_SECONDS = 5.0
 GEMINI_MAX_RETRIES = 4
 AI_MODE_MAX_ATTEMPTS = 2
@@ -65,6 +69,114 @@ _GEMINI_CACHE: Dict[str, Dict[str, Any]] = {}
 _GEMINI_CACHE_LOCK = threading.Lock()
 _GEMINI_RATE_LOCK = threading.Lock()
 _GEMINI_NEXT_REQUEST_AT = 0.0
+
+class ClinicCache:
+    """Durable Maps, AI Mode and Gemini evidence shared by future runs."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=20)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 20000")
+        return connection
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS clinic_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    place_id TEXT,
+                    normalized_name TEXT,
+                    city TEXT,
+                    phone TEXT,
+                    domain TEXT,
+                    address TEXT,
+                    maps_json TEXT NOT NULL,
+                    ai_evidence TEXT NOT NULL DEFAULT '',
+                    gemini_json TEXT NOT NULL DEFAULT '',
+                    gemini_status TEXT NOT NULL DEFAULT '',
+                    prompt_version INTEGER NOT NULL DEFAULT 0,
+                    rule_version INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                )
+            """)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(clinic_cache)")}
+            if "city" not in columns:
+                connection.execute("ALTER TABLE clinic_cache ADD COLUMN city TEXT NOT NULL DEFAULT ''")
+            for column in ("place_id", "normalized_name", "phone", "domain"):
+                connection.execute(f"CREATE INDEX IF NOT EXISTS idx_clinic_cache_{column} ON clinic_cache({column})")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_clinic_cache_name_city ON clinic_cache(normalized_name, city)")
+
+    @staticmethod
+    def _lookup_values(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
+        return (
+            normalize_text(row.get("maps place id", "")),
+            normalized_practice_name(row.get("Practice name", row.get("Practice Name", ""))),
+            normalized_phone(row.get("phone number", row.get("Phone Number", ""))),
+            normalized_website_domain(row.get("website link", row.get("Website Link", ""))),
+        )
+
+    @staticmethod
+    def _cache_key(row: Dict[str, Any]) -> str:
+        place_id, name, phone, domain = ClinicCache._lookup_values(row)
+        if place_id: return f"place:{place_id}"
+        if domain: return f"domain:{domain}"
+        if phone: return f"phone:{phone}"
+        city = normalize_text(row.get("location", "")).casefold()
+        return f"name:{name}|city:{city}"
+
+    def lookup(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        place_id, name, phone, domain = self._lookup_values(row)
+        city = normalize_text(row.get("location", "")).casefold()
+        lookups: List[Tuple[str, Tuple[Any, ...]]] = []
+        if place_id: lookups.append(("place_id = ?", (place_id,)))
+        strong_clauses, strong_values = [], []
+        if domain: strong_clauses.append("domain = ?"); strong_values.append(domain)
+        if phone: strong_clauses.append("phone = ?"); strong_values.append(phone)
+        if strong_clauses: lookups.append((" OR ".join(strong_clauses), tuple(strong_values)))
+        if name and city: lookups.append(("normalized_name = ? AND city = ?", (name, city)))
+        if not lookups: return None
+        cutoff = time.time() - CACHE_TTL_DAYS * 86400
+        with self._connect() as connection:
+            record = None
+            for clause, values in lookups:
+                record = connection.execute(
+                    f"SELECT * FROM clinic_cache WHERE ({clause}) AND updated_at >= ? ORDER BY updated_at DESC LIMIT 1",
+                    (*values, cutoff),
+                ).fetchone()
+                if record is not None: break
+        if record is None: return None
+        result = dict(record)
+        try: result["maps"] = json.loads(result.pop("maps_json"))
+        except (ValueError, TypeError): result["maps"] = {}
+        try: result["gemini"] = json.loads(result.pop("gemini_json")) if result.get("gemini_json") else None
+        except (ValueError, TypeError): result["gemini"] = None
+        return result
+
+    def save(self, row: Dict[str, Any], ai_evidence: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
+        existing = self.lookup(row) or {}
+        place_id, name, phone, domain = self._lookup_values(row)
+        saved_ai = existing.get("ai_evidence", "") if ai_evidence is None else ai_evidence
+        saved_metadata = existing.get("gemini") if metadata is None else metadata
+        gemini_status = normalize_text((saved_metadata or {}).get("status", existing.get("gemini_status", "")))
+        with self._connect() as connection:
+            connection.execute("""
+                INSERT OR REPLACE INTO clinic_cache
+                (cache_key, place_id, normalized_name, city, phone, domain, address, maps_json, ai_evidence,
+                 gemini_json, gemini_status, prompt_version, rule_version, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                self._cache_key(row), place_id, name, normalize_text(row.get("location", "")).casefold(), phone, domain, normalize_text(row.get("address", "")),
+                json.dumps(row, ensure_ascii=False), saved_ai,
+                json.dumps(saved_metadata, ensure_ascii=False) if saved_metadata else "", gemini_status,
+                CACHE_PROMPT_VERSION if saved_metadata else int(existing.get("prompt_version", 0) or 0),
+                CACHE_RULE_VERSION, time.time(),
+            ))
 
 @dataclass
 class Evidence:
@@ -240,6 +352,27 @@ def maps_value(driver: webdriver.Chrome, selectors: Sequence[str]) -> str:
         except WebDriverException: continue
     return "N/A"
 
+def maps_place_id_from_url(url: str) -> str:
+    """Extract Google's stable place/feature identifier when it is present."""
+    decoded = unquote_plus(normalize_text(url))
+    for pattern in (r"[?&]query_place_id=([^&]+)", r"[?&]ftid=([^&]+)", r"!1s([^!/?&]+)"):
+        match = re.search(pattern, decoded, re.I)
+        if match: return normalize_text(match.group(1))
+    return ""
+
+def early_maps_rejection(row: Dict[str, Any]) -> str:
+    """Reject only explicit Maps categories/statuses that are unambiguous."""
+    raw = normalize_text(row.get("maps raw text", "")).casefold()
+    category = normalize_text(row.get("maps category", "")).casefold()
+    if any(marker in raw for marker in ("permanently closed", "đã đóng cửa vĩnh viễn")):
+        return "permanently closed on Google Maps"
+    rejected_categories = {
+        "psychiatric hospital", "addiction treatment center", "government office", "medical center"
+    }
+    if category in rejected_categories:
+        return f"Google Maps category: {category}"
+    return ""
+
 def extract_maps_place(driver: webdriver.Chrome, url: str, city: str, name_hint: str = "N/A") -> Dict[str, Any]:
     driver.get(url); WebDriverWait(driver, 10).until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")); time.sleep(.8)
     # Maps is a client-rendered app: the title is often delayed, but some valid
@@ -254,7 +387,10 @@ def extract_maps_place(driver: webdriver.Chrome, url: str, city: str, name_hint:
     try: website = normalize_website(driver.find_element(By.CSS_SELECTOR, "a[data-item-id='authority']").get_attribute("href"))
     except WebDriverException: pass
     rating = maps_value(driver, ("div.F7nice span[aria-label*='star']", "span[aria-label*='star']")); match = re.search(r"\b(\d(?:\.\d)?)\s*(?:stars?|sao)\b", rating, re.I)
-    return {"Practice name": name, "phone number": phone, "website link": website, "location": city, "operation time and days": extract_operation_time_from_text(raw), "rating star": match.group(1) if match else "N/A", "maps raw text": raw}
+    address = maps_value(driver, ("button[data-item-id='address']", "[aria-label^='Address:']", "[aria-label^='Địa chỉ:']"))
+    address = re.sub(r"^(?:Address|Địa chỉ):\s*", "", address, flags=re.I)
+    category = maps_value(driver, ("button.DkEaL", "button[jsaction*='category']", ".DkEaL"))
+    return {"Practice name": name, "phone number": phone, "website link": website, "location": city, "address": address, "maps category": category, "maps place id": maps_place_id_from_url(driver.current_url or url), "operation time and days": extract_operation_time_from_text(raw), "rating star": match.group(1) if match else "N/A", "maps raw text": raw}
 
 def extract_maps_place_with_retry(driver: webdriver.Chrome, url: str, city: str, name_hint: str, status: Any, should_stop: Optional[Any] = None) -> Dict[str, Any]:
     """Retry one transient Maps page-load failure; CAPTCHA remains manual."""
@@ -407,18 +543,22 @@ def gemini_retry_delay(response: Any, attempt: int) -> float:
     except (ValueError, AttributeError): pass
     return min(30.0, float(2 ** (attempt + 1)))
 
-def gemini_metadata(api_key: str, row: Dict[str, Any], ai_overview: str) -> Dict[str, Any]:
+def gemini_metadata(api_key: str, row: Dict[str, Any], ai_overview: str, requested_fields: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """Strict JSON fact extraction from Maps/AI Overview, with no website crawl."""
     fallback = {"owner": "N/A", "owner_role": "N/A", "operation_time_and_days": "N/A", "doctor_count": None, "branch_count": None, "is_solo": None, "is_collective": None, "direct_therapist_phone": None, "nonprofit": None, "private_practice": None, "target_service": None, "red_flags": [], "disallowed_provider_title": None, "outdated_or_insufficient": None, "over_25_years": None, "has_board": None, "status": "not_called"}
     if not api_key.strip(): return fallback
     maps_text = normalize_text(row.get("maps raw text", ""))
     ai_text = normalize_text(ai_overview or "Not shown")
     evidence = f"Google Maps place text:\n{maps_text}\n\nVisible Google AI Overview:\n{ai_text}"
-    cache_key = f"{row.get('Practice name', '')}|{row.get('location', '')}|{evidence}"
+    focus = tuple(sorted(requested_fields or ()))
+    cache_key = f"{row.get('Practice name', '')}|{row.get('location', '')}|{focus}|{evidence}"
     with _GEMINI_CACHE_LOCK:
         cached = _GEMINI_CACHE.get(cache_key)
     if cached is not None: return cached
-    prompt = """You extract verifiable facts for a US therapy/counseling clinic lead. Use ONLY the supplied Google Maps text and visible Google AI Mode response. Do not use website content, do not browse, and do not invent. Return one JSON object only with exactly these keys: owner (one explicit full personal name, otherwise 'N/A'), owner_role (the explicit role proving ownership: owner, co-owner, founder, co-founder, CEO, or chief executive officer; otherwise 'N/A'), operation_time_and_days (a concise schedule with days and valid AM/PM times only when explicitly stated, otherwise 'N/A'), doctor_count (exact current number of therapists/providers as an integer only when explicitly supported, otherwise null; never convert 'under 10', ranges, directory result counts, or estimates into an integer), branch_count (exact number of physical locations operated by this practice only when explicitly supported, otherwise null; do not count telehealth service areas, nearby cities, partner organizations, or places merely mentioned), is_solo (true/false/null), is_collective (true/false/null), direct_therapist_phone (true only when the evidence explicitly associates a distinct direct/personal phone number with a named therapist; a clinic reception, main office, call center, shared scheduling, or unlabeled Maps phone is false/null), nonprofit (true/false/null), private_practice (true/false/null), target_service (true/false/null only for individual/couples/family/teen therapy, anxiety, depression, trauma, ADHD, bipolar, OCD, DBT, CBT, EMDR, play, art, IFS or listed licenses), red_flags (array containing only actual, directly offered clinic services among intensive outpatient, substance abuse, addiction treatment, medical treatment, peer support, medication management, case management, psychiatric hospital), disallowed_provider_title (true only for an explicit MD, DO, or PMHNP provider; otherwise false/null), outdated_or_insufficient (true only when the evidence explicitly says permanently closed, website down/unavailable/outdated, otherwise false/null), over_25_years (true only for an explicit 25+ years of experience/serving claim, otherwise false/null), has_board (true only for an explicit board of directors, otherwise false/null). Owner accuracy is strict: owner and owner_role must refer to the same named person in an explicit ownership statement. Never infer ownership from clinical director, authorized official, therapist, contact person, domain registration, seniority, or phrases such as 'likely managed by'. For red_flags: include an item ONLY when this clinic directly provides it as a real program/service. Never include it when the evidence says it is not offered, is only a referral to another provider, is offered by a parent/partner/sister organization rather than this clinic, or merely mentions a client condition, a search question, a support group, academic support, or ordinary psychotherapy. In particular, do not treat behavior issues (for example pornography/gaming struggles) as substance abuse or addiction treatment unless a dedicated substance-use/addiction-treatment program is explicitly offered. Do not treat group/family therapy as peer support, or treatment planning as case management. For is_collective: return true ONLY when evidence explicitly calls it a therapist/independent-therapist collective, or says clinicians operate independently under a collective umbrella. Return false for an ordinary group practice, a clinic with a team, a multi-therapist private practice, a collaborative staff, or co-owned practice; those are valid prospects and are not therapist collectives. For nonprofit: return false when the evidence explicitly says it is private, for-profit, or 'not a nonprofit/government agency'. State licensing, Medicaid/public insurance, court approval, government regulation, or a .gov citation do NOT make a private clinic government-owned. Return true only for an affirmative nonprofit, state-owned, government-owned, government-run, or government-funded claim.\n\nEVIDENCE:\n""" + evidence
+    prompt = """You extract verifiable facts for a US therapy/counseling clinic lead. Use ONLY the supplied Google Maps text and visible Google AI Mode response. Do not use website content, do not browse, and do not invent. Return one JSON object only with exactly these keys: owner (one explicit full personal name, otherwise 'N/A'), owner_role (the explicit role proving ownership: owner, co-owner, founder, co-founder, CEO, or chief executive officer; otherwise 'N/A'), operation_time_and_days (a concise schedule with days and valid AM/PM times only when explicitly stated, otherwise 'N/A'), doctor_count (exact current number of therapists/providers as an integer only when explicitly supported, otherwise null; never convert 'under 10', ranges, directory result counts, or estimates into an integer), branch_count (exact number of physical locations operated by this practice only when explicitly supported, otherwise null; do not count telehealth service areas, nearby cities, partner organizations, or places merely mentioned), is_solo (true/false/null), is_collective (true/false/null), direct_therapist_phone (true only when the evidence explicitly associates a distinct direct/personal phone number with a named therapist; a clinic reception, main office, call center, shared scheduling, or unlabeled Maps phone is false/null), nonprofit (true/false/null), private_practice (true/false/null), target_service (true/false/null only for individual/couples/family/teen therapy, anxiety, depression, trauma, ADHD, bipolar, OCD, DBT, CBT, EMDR, play, art, IFS or listed licenses), red_flags (array containing only actual, directly offered clinic services among intensive outpatient, substance abuse, addiction treatment, medical treatment, peer support, medication management, case management, psychiatric hospital), disallowed_provider_title (true only for an explicit MD, DO, or PMHNP provider; otherwise false/null), outdated_or_insufficient (true only when the evidence explicitly says permanently closed, website down/unavailable/outdated, otherwise false/null), over_25_years (true only for an explicit 25+ years of experience/serving claim, otherwise false/null), has_board (true only for an explicit board of directors, otherwise false/null). Owner accuracy is strict: owner and owner_role must refer to the same named person in an explicit ownership statement. Never infer ownership from clinical director, authorized official, therapist, contact person, domain registration, seniority, or phrases such as 'likely managed by'. For red_flags: include an item ONLY when this clinic directly provides it as a real program/service. Never include it when the evidence says it is not offered, is only a referral to another provider, is offered by a parent/partner/sister organization rather than this clinic, or merely mentions a client condition, a search question, a support group, academic support, or ordinary psychotherapy. In particular, do not treat behavior issues (for example pornography/gaming struggles) as substance abuse or addiction treatment unless a dedicated substance-use/addiction-treatment program is explicitly offered. Do not treat group/family therapy as peer support, or treatment planning as case management. For is_collective: return true when clinicians operate as independent businesses under a shared collective/umbrella, market themselves separately, receive clients independently, or use therapist-specific contact details. Return false for an ordinary group practice where clinicians are members of the same clinic, even if the clinic has a team, collaborative staff, or co-owners. For nonprofit: return false when the evidence explicitly says it is private, for-profit, or 'not a nonprofit/government agency'. State licensing, Medicaid/public insurance, court approval, government regulation, or a .gov citation do NOT make a private clinic government-owned. Return true only for an affirmative nonprofit, state-owned, government-owned, government-run, or government-funded claim.\n\n"""
+    if focus:
+        prompt += "This is one final targeted extraction. Concentrate only on these previously missing fields: " + ", ".join(focus) + ". Keep every other field null, false, empty, or 'N/A' rather than reinterpreting it.\n\n"
+    prompt += "EVIDENCE:\n" + evidence
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key.strip()}"
     try:
         response = None
@@ -428,7 +568,7 @@ def gemini_metadata(api_key: str, row: Dict[str, Any], ai_overview: str) -> Dict
             if response.status_code != 429: break
             if attempt < GEMINI_MAX_RETRIES - 1: time.sleep(gemini_retry_delay(response, attempt))
         if response is None or response.status_code != 200:
-            fallback["status"] = f"HTTP {response.status_code if response is not None else 'no response'}"
+            fallback["status"] = "rate_limited" if response is not None and response.status_code == 429 else f"HTTP {response.status_code if response is not None else 'no response'}"
             return fallback
         raw = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
@@ -465,6 +605,49 @@ def merge_gemini_evidence(base: Evidence, metadata: Dict[str, Any]) -> Evidence:
     base.red_flags = list(metadata.get("red_flags", []))
     return base
 
+def important_missing_fields(metadata: Dict[str, Any], ai_evidence: str) -> List[str]:
+    """Retry only facts that appear present in evidence but were missed once."""
+    if metadata.get("_targeted_attempted"): return []
+    text = normalize_text(ai_evidence)
+    missing: List[str] = []
+    if metadata.get("owner", "N/A") == "N/A" and re.search(r"\b(?:owner|founder|co-founder|CEO|chief executive officer)\b", text, re.I):
+        missing.extend(["owner", "owner_role"])
+    if metadata.get("doctor_count") is None and re.search(r"\b\d+\s+(?:therapists?|counselors?|providers?|clinicians?)\b", text, re.I):
+        missing.append("doctor_count")
+    return missing
+
+def merge_targeted_metadata(primary: Dict[str, Any], targeted: Dict[str, Any], fields: Sequence[str]) -> Dict[str, Any]:
+    result = dict(primary)
+    result["_targeted_attempted"] = True
+    if targeted.get("status") == "ok":
+        for field_name in fields:
+            value = targeted.get(field_name)
+            if value not in (None, "", "N/A", []): result[field_name] = value
+    result["status"] = "ok"
+    return result
+
+def candidate_result(row: Dict[str, Any], ai_mode_evidence: str, metadata: Dict[str, Any]) -> Tuple[Dict[str, Any], bool, Dict[str, Any]]:
+    """Apply the current rules to one cached or newly extracted Gemini result."""
+    output_row = dict(row)
+    evidence = merge_gemini_evidence(Evidence(), metadata)
+    verification = evidence_as_verification(evidence)
+    output_row["Owner's name"] = evidence.owner
+    gemini_hours = metadata.get("operation_time_and_days", "N/A")
+    if metadata.get("status") == "ok" and gemini_hours != "N/A":
+        output_row["operation time and days"] = gemini_hours
+    keep = should_keep_in_final_output(verification)
+    debug = {
+        "Practice": output_row["Practice name"], "Keep": keep, "Filter result": filter_result(verification),
+        "Owner": evidence.owner, "Operation Time": output_row["operation time and days"],
+        "Therapists": str(evidence.doctor_count) if evidence.doctor_count is not None else "UNKNOWN",
+        "Private practice": "YES" if evidence.private_practice is True else ("NO" if evidence.private_practice is False else "UNKNOWN"),
+        "Target services": "YES" if evidence.target_service is True else ("NO" if evidence.target_service is False else "UNKNOWN"),
+        "Direct therapist phone": "YES" if evidence.direct_therapist_phone else "NO",
+        "AI Mode evidence": ai_mode_evidence, "Gemini": metadata.get("status"),
+        "Reasons": "; ".join(evidence.red_flags) or "eligible / insufficient evidence", "_export_row": dict(output_row),
+    }
+    return output_row, keep, debug
+
 def format_export(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame([{ "Practice Name": r.get("Practice name", "N/A"), "Website Link": r.get("website link", "N/A"), "Phone Number": r.get("phone number", "N/A"), "Location (City Ne Only)": r.get("location", "N/A"), "Operation Time and Days": r.get("operation time and days", "N/A"), "Rating Star": r.get("rating star", "N/A"), "Owner": r.get("Owner's name", "N/A")} for r in rows], columns=EXPORT_COLUMNS)
 
@@ -493,15 +676,23 @@ def normalized_website_domain(value: Any) -> str:
     is_shared = any(domain == shared or domain.endswith("." + shared) for shared in shared_domains)
     return "" if not domain or is_shared else domain
 
+def normalized_address(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", normalize_text(value)).encode("ascii", "ignore").decode("ascii").lower()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
 def lead_identity_keys(row: Dict[str, Any]) -> set:
     """Return independent organization identifiers; any exact match is a duplicate."""
     name = normalized_practice_name(row.get("Practice name", row.get("Practice Name", "")))
     phone = normalized_phone(row.get("phone number", row.get("Phone Number", "")))
     domain = normalized_website_domain(row.get("website link", row.get("Website Link", "")))
+    place_id = normalize_text(row.get("maps place id", ""))
+    address = normalized_address(row.get("address", ""))
     keys = set()
     if len(name) >= 5: keys.add(f"name:{name}")
     if phone: keys.add(f"phone:{phone}")
     if domain: keys.add(f"domain:{domain}")
+    if place_id: keys.add(f"place:{place_id}")
+    if name and address: keys.add(f"name-address:{name}|{address}")
     return keys
 
 def candidate_id(sheet: str, row: Dict[str, Any]) -> str:
@@ -591,7 +782,7 @@ def new_workbook(rows_by_sheet: Dict[str, pd.DataFrame]) -> bytes:
         for sheet, rows in rows_by_sheet.items(): rows.to_excel(writer, sheet_name=sheet, index=False)
     return output.getvalue()
 
-def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit: int, known: set, progress: Any, gemini_api_key: str = "", on_accept: Optional[Any] = None, on_debug: Optional[Any] = None, on_candidate_progress: Optional[Any] = None, on_retry_waiting: Optional[Any] = None, should_stop: Optional[Any] = None, known_lock: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit: int, known: set, progress: Any, gemini_api_key: str = "", on_debug: Optional[Any] = None, on_candidate_progress: Optional[Any] = None, on_retry_waiting: Optional[Any] = None, should_stop: Optional[Any] = None, known_lock: Optional[Any] = None, cache: Optional[ClinicCache] = None, on_ai_ready: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     accepted: List[Dict[str, Any]] = []; debug: List[Dict[str, Any]] = []
     def record_debug(item: Dict[str, Any]) -> None:
         debug.append(item)
@@ -610,7 +801,9 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
             progress(f"{city}: {keyword} — {position}/{len(places)}")
         row: Optional[Dict[str, Any]] = None
         reserved_keys = set()
+        maps_from_cache = False
         try:
+            cached: Optional[Dict[str, Any]] = None
             if saved_row is None:
                 hint_keys = lead_identity_keys({"Practice name": name_hint})
                 if hint_keys:
@@ -620,7 +813,18 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                     if hint_is_duplicate:
                         record_debug({"Practice": name_hint, "Keep": False, "Filter result": "SKIP: duplicate lead", "Owner": "N/A", "Operation Time": "N/A", "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "not called", "Gemini": "not called", "Reasons": "Matched an existing normalized practice name before AI Mode"})
                         continue
-            row = dict(saved_row) if saved_row is not None else extract_maps_place_with_retry(driver, url, city, name_hint, progress, should_stop)
+                place_id = maps_place_id_from_url(url)
+                if cache and place_id:
+                    cached = cache.lookup({"maps place id": place_id})
+            if saved_row is not None:
+                row = dict(saved_row)
+            elif cached and cached.get("maps"):
+                row = dict(cached["maps"])
+                row["location"] = city
+                maps_from_cache = True
+                progress(f"{name_hint}: dùng Maps data đã lưu trong cache…")
+            else:
+                row = extract_maps_place_with_retry(driver, url, city, name_hint, progress, should_stop)
             if should_stop and should_stop(): break
             if row["Practice name"] == "N/A":
                 record_debug({"Practice": "N/A", "Keep": False, "Filter result": "SKIP: không đọc được tên từ Google Maps", "Owner": "N/A", "Operation Time": "N/A", "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "N/A", "Gemini": "not called", "Reasons": "Google Maps listing could not be read"})
@@ -634,9 +838,24 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                 is_duplicate = bool(reserved_keys & known)
                 if not is_duplicate: known.update(reserved_keys)
             if is_duplicate:
-                record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": "SKIP: duplicate lead", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "not called", "Gemini": "not called", "Reasons": "Matched an existing practice name, direct phone, or official website domain"})
+                record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": "SKIP: duplicate lead", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "not called", "Gemini": "not called", "Reasons": "Matched an existing place ID, practice name, address, direct phone, or official website domain"})
                 continue
-            ai_mode_evidence = google_ai_overview(driver, row["Practice name"], city, state, progress, should_stop)
+            if cache:
+                if not maps_from_cache: cache.save(row)
+                cached = cache.lookup(row)
+            early_reason = early_maps_rejection(row)
+            if early_reason:
+                record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": f"REJECT: {early_reason}", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "not called", "Gemini": "not called", "Reasons": early_reason, "_export_row": dict(row)})
+                continue
+            cached_metadata = cached.get("gemini") if cached and cached.get("prompt_version") == CACHE_PROMPT_VERSION and cached.get("rule_version") == CACHE_RULE_VERSION and cached.get("gemini_status") == "ok" else None
+            ai_mode_evidence = normalize_text(cached.get("ai_evidence", "")) if cached else ""
+            ai_from_cache = bool(ai_mode_evidence)
+            if cached_metadata and ai_mode_evidence:
+                progress(f"{row['Practice name']}: dùng AI Mode + Gemini đã lưu trong cache…")
+            elif ai_mode_evidence:
+                progress(f"{row['Practice name']}: dùng AI Mode evidence đã lưu; chỉ chờ Gemini…")
+            else:
+                ai_mode_evidence = google_ai_overview(driver, row["Practice name"], city, state, progress, should_stop)
             if should_stop and should_stop(): break
             if not ai_mode_evidence:
                 # Never ask Gemini to decide from Maps alone when the required AI
@@ -654,15 +873,22 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                     continue
                 record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": "RETRY: AI Mode chưa hoàn tất", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "", "Gemini": "not called", "Reasons": "AI Mode did not produce a complete stable answer after retries"})
                 continue
+            if cache and not ai_from_cache: cache.save(row, ai_evidence=ai_mode_evidence)
+            if on_ai_ready:
+                on_ai_ready(dict(row), ai_mode_evidence, cached_metadata)
+                continue
             overview = f"AI MODE (structured clinic screening query):\n{ai_mode_evidence}"
-            metadata = gemini_metadata(gemini_api_key, row, overview); e = merge_gemini_evidence(Evidence(), metadata); v = evidence_as_verification(e); row["Owner's name"] = e.owner
-            gemini_hours = metadata.get("operation_time_and_days", "N/A")
-            if metadata.get("status") == "ok" and gemini_hours != "N/A": row["operation time and days"] = gemini_hours
-            keep = should_keep_in_final_output(v)
+            metadata = cached_metadata or gemini_metadata(gemini_api_key, row, overview)
+            if cache and not cached_metadata: cache.save(row, ai_evidence=ai_mode_evidence, metadata=metadata)
+            if metadata.get("status") != "ok":
+                status = normalize_text(metadata.get("status", "error"))
+                label = "Gemini quota" if status == "rate_limited" else "Gemini error"
+                record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": f"WAITING: {label}", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": ai_mode_evidence, "Gemini": status, "Reasons": "AI Mode evidence was saved; Gemini can resume from cache next run", "_export_row": dict(row)})
+                continue
+            row, keep, debug_item = candidate_result(row, ai_mode_evidence, metadata)
             if keep:
                 accepted.append(row)
-                if on_accept: on_accept(row)
-            record_debug({"Practice": row["Practice name"], "Keep": keep, "Filter result": filter_result(v), "Owner": e.owner, "Operation Time": row["operation time and days"], "Therapists": str(e.doctor_count) if e.doctor_count is not None else "UNKNOWN", "Private practice": "YES" if e.private_practice is True else ("NO" if e.private_practice is False else "UNKNOWN"), "Target services": "YES" if e.target_service is True else ("NO" if e.target_service is False else "UNKNOWN"), "Direct therapist phone": "YES" if e.direct_therapist_phone else "NO", "AI Mode evidence": ai_mode_evidence, "Gemini": metadata.get("status"), "Reasons": "; ".join(e.red_flags) or "eligible / insufficient evidence", "_export_row": dict(row)})
+            record_debug(debug_item)
         except (TimeoutException, WebDriverException) as exc:
             if reserved_keys:
                 if known_lock:
@@ -696,6 +922,10 @@ def checkpoint_directory() -> Path:
         try: old_file.unlink()
         except OSError: pass
     return base
+
+def cache_database_path() -> Path:
+    """Keep durable evidence beside checkpoints, outside the installed bundle."""
+    return checkpoint_directory().parent / "clinic_cache.sqlite"
 
 def installed_app_directory() -> Path:
     if not getattr(sys, "frozen", False):
@@ -776,19 +1006,20 @@ def render_update_control() -> None:
         os._exit(0)
 
 def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Run a small visible-Chrome worker pool and checkpoint every accepted lead."""
+    """Run two browser collectors feeding one quota-aware Gemini processor."""
     global _GEMINI_NEXT_REQUEST_AT
     with _GEMINI_CACHE_LOCK:
         _GEMINI_CACHE.clear()
     with _GEMINI_RATE_LOCK:
         _GEMINI_NEXT_REQUEST_AT = 0.0
     checkpoint_dir = checkpoint_directory()
+    cache = ClinicCache(Path(config.get("cache_path") or cache_database_path()))
     job: Dict[str, Any] = {
         **config, "lock": threading.Lock(), "stop_event": threading.Event(), "running": True,
         "message": "Đang chuẩn bị…", "error": "",
         "known_lock": threading.Lock(), "captcha_workers": {},
         "task_total": len(config["jobs"]) * len(config["keywords"]),
-        "tasks_completed": 0, "task_progress": {}, "retry_waiting": 0,
+        "tasks_completed": 0, "task_progress": {}, "retry_waiting": 0, "gemini_pending": 0, "cache_hits": 0,
         "rows_by_sheet": {sheet: [] for _, _, sheet in config["jobs"]}, "debug": [], "candidates": {},
         "checkpoint_path": str(checkpoint_dir / f"clinic_leads_checkpoint_{uuid.uuid4().hex[:8]}.xlsx"),
         "checkpoint_bytes": b"", "captcha_active": False, "captcha_notified": False, "captcha_sound_played": False,
@@ -797,10 +1028,109 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
         save_checkpoint_locked(job)
     def worker() -> None:
         tasks: Queue = Queue()
+        gemini_tasks: Queue = Queue()
         for city, state, sheet in job["jobs"]:
             for keyword in job["keywords"]:
                 tasks.put((city, state, sheet, keyword))
         worker_count = min(max(1, int(job.get("parallel_workers", 1))), 5, tasks.qsize() or 1)
+
+        def append_accepted(row: Dict[str, Any], sheet: str) -> None:
+            with job["lock"]:
+                job["rows_by_sheet"][sheet].append(row)
+                save_checkpoint_locked(job)
+                job["message"] = f"Đã tự động lưu: {sum(len(x) for x in job['rows_by_sheet'].values())} lead mới."
+
+        def append_debug(item: Dict[str, Any], sheet: str, city: str, state: str) -> None:
+            with job["lock"]:
+                export_row = item.pop("_export_row", None)
+                if export_row:
+                    item["Candidate ID"] = candidate_id(sheet, export_row)
+                    job["candidates"][item["Candidate ID"]] = export_row
+                job["debug"].append({**item, "Sheet": sheet, "City": city, "State": state})
+
+        def finish_gemini_item(item: Dict[str, Any], metadata: Dict[str, Any]) -> None:
+            row, keep, debug_item = candidate_result(item["row"], item["ai_evidence"], metadata)
+            if not item.get("cached_metadata") or metadata != item.get("cached_metadata"):
+                cache.save(row, ai_evidence=item["ai_evidence"], metadata=metadata)
+            if keep: append_accepted(row, item["sheet"])
+            append_debug(debug_item, item["sheet"], item["city"], item["state"])
+            with job["lock"]:
+                job["gemini_pending"] = max(0, job["gemini_pending"] - 1)
+
+        def mark_gemini_waiting(item: Dict[str, Any], status: str) -> None:
+            cache.save(item["row"], ai_evidence=item["ai_evidence"], metadata={"status": status})
+            label = "Gemini quota" if status == "rate_limited" else "Gemini error"
+            append_debug({
+                "Practice": item["row"]["Practice name"], "Keep": False, "Filter result": f"WAITING: {label}",
+                "Owner": "N/A", "Operation Time": item["row"].get("operation time and days", "N/A"),
+                "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN",
+                "AI Mode evidence": item["ai_evidence"], "Gemini": status,
+                "Reasons": "Maps and AI Mode evidence are saved in SQLite; the next run resumes at Gemini.",
+                "_export_row": dict(item["row"]),
+            }, item["sheet"], item["city"], item["state"])
+            with job["lock"]:
+                job["gemini_pending"] = max(0, job["gemini_pending"] - 1)
+
+        def gemini_processor() -> None:
+            api_retry: List[Dict[str, Any]] = []
+            targeted_retry: List[Tuple[Dict[str, Any], Dict[str, Any], List[str]]] = []
+            while True:
+                item = gemini_tasks.get()
+                try:
+                    if item is None:
+                        break
+                    metadata = item.get("cached_metadata")
+                    if metadata:
+                        with job["lock"]: job["cache_hits"] += 1
+                    else:
+                        overview = f"AI MODE (structured clinic screening query):\n{item['ai_evidence']}"
+                        metadata = gemini_metadata(job["gemini_api_key"], item["row"], overview)
+                        cache.save(item["row"], ai_evidence=item["ai_evidence"], metadata=metadata)
+                    if metadata.get("status") != "ok":
+                        api_retry.append(item)
+                    else:
+                        missing = important_missing_fields(metadata, item["ai_evidence"])
+                        if missing:
+                            targeted_retry.append((item, metadata, missing))
+                        else:
+                            finish_gemini_item(item, metadata)
+                except Exception as exc:
+                    mark_gemini_waiting(item, f"error: {type(exc).__name__}")
+                finally:
+                    gemini_tasks.task_done()
+
+            # Only after every clinic has had its primary extraction do we spend
+            # quota on a single focused request for evidence Gemini likely missed.
+            for item, primary, missing in targeted_retry:
+                try:
+                    overview = f"AI MODE (structured clinic screening query):\n{item['ai_evidence']}"
+                    targeted = gemini_metadata(job["gemini_api_key"], item["row"], overview, requested_fields=missing)
+                    finish_gemini_item(item, merge_targeted_metadata(primary, targeted, missing))
+                except Exception:
+                    # The primary extraction is still valid; do not lose it just
+                    # because the optional focused pass failed.
+                    finish_gemini_item(item, merge_targeted_metadata(primary, {"status": "error"}, missing))
+
+            # A rate-limited primary request waits behind useful work and gets one
+            # final processing pass. Persistent AI evidence makes the next app run
+            # resume here instead of reopening Google if the daily quota is gone.
+            for item in api_retry:
+                try:
+                    overview = f"AI MODE (structured clinic screening query):\n{item['ai_evidence']}"
+                    metadata = gemini_metadata(job["gemini_api_key"], item["row"], overview)
+                    if metadata.get("status") != "ok":
+                        mark_gemini_waiting(item, normalize_text(metadata.get("status", "error")))
+                    else:
+                        missing = important_missing_fields(metadata, item["ai_evidence"])
+                        if missing:
+                            targeted = gemini_metadata(job["gemini_api_key"], item["row"], overview, requested_fields=missing)
+                            metadata = merge_targeted_metadata(metadata, targeted, missing)
+                        finish_gemini_item(item, metadata)
+                except Exception as exc:
+                    mark_gemini_waiting(item, f"error: {type(exc).__name__}")
+
+        gemini_thread = threading.Thread(target=gemini_processor, daemon=True, name="clinic-gemini")
+        gemini_thread.start()
 
         def browser_worker(worker_number: int) -> None:
             driver: Optional[webdriver.Chrome] = None
@@ -822,18 +1152,13 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                                     if winsound:
                                         threading.Thread(target=lambda: winsound.MessageBeep(winsound.MB_ICONEXCLAMATION), daemon=True).start()
                                 job["message"] = f"Chrome {worker_number}/{worker_count}: {message}"
-                        def on_accept(row: Dict[str, Any], target_sheet: str = sheet) -> None:
-                            with job["lock"]:
-                                job["rows_by_sheet"][target_sheet].append(row)
-                                save_checkpoint_locked(job)
-                                job["message"] = f"Đã tự động lưu: {sum(len(x) for x in job['rows_by_sheet'].values())} lead mới."
                         def on_debug(item: Dict[str, Any], target_sheet: str = sheet) -> None:
+                            append_debug(item, target_sheet, city, state)
+                        def on_ai_ready(row: Dict[str, Any], ai_evidence: str, cached_metadata: Optional[Dict[str, Any]], target_sheet: str = sheet) -> None:
+                            gemini_tasks.put({"row": row, "ai_evidence": ai_evidence, "cached_metadata": cached_metadata, "sheet": target_sheet, "city": city, "state": state})
                             with job["lock"]:
-                                export_row = item.pop("_export_row", None)
-                                if export_row:
-                                    item["Candidate ID"] = candidate_id(target_sheet, export_row)
-                                    job["candidates"][item["Candidate ID"]] = export_row
-                                job["debug"].append({**item, "Sheet": target_sheet, "City": city, "State": state})
+                                job["gemini_pending"] += 1
+                                job["message"] = f"Đã xếp {row['Practice name']} vào hàng đợi Gemini ({job['gemini_pending']} đang chờ)."
                         def on_candidate_progress(done: int, total: int) -> None:
                             with job["lock"]:
                                 job["task_progress"][worker_number] = (0.9 * done / total) if total else 0.0
@@ -842,9 +1167,10 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                                 job["retry_waiting"] = max(0, job["retry_waiting"] + delta)
                         run_job(
                             driver, city, state, keyword, job["limit"], job["known"], progress, job["gemini_api_key"],
-                            on_accept=on_accept, on_debug=on_debug,
+                            on_debug=on_debug,
                             on_candidate_progress=on_candidate_progress, on_retry_waiting=on_retry_waiting,
                             should_stop=job["stop_event"].is_set, known_lock=job["known_lock"],
+                            cache=cache, on_ai_ready=on_ai_ready,
                         )
                     except Exception as exc:
                         with job["lock"]:
@@ -868,6 +1194,9 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
         workers = [threading.Thread(target=browser_worker, args=(number,), daemon=True, name=f"clinic-browser-{number}") for number in range(1, worker_count + 1)]
         for browser_thread in workers: browser_thread.start()
         for browser_thread in workers: browser_thread.join()
+        gemini_tasks.put(None)
+        gemini_tasks.join()
+        gemini_thread.join()
         try:
             with job["lock"]:
                 save_checkpoint_locked(job)
@@ -939,15 +1268,20 @@ def _render_background_job(job: Dict[str, Any]) -> None:
         kept_count = sum(bool(item.get("Keep")) for item in debug)
         rejected_count = max(0, checked_count - kept_count)
         retry_waiting = int(job.get("retry_waiting", 0))
+        gemini_pending = int(job.get("gemini_pending", 0))
+        cache_hits = int(job.get("cache_hits", 0))
+        if running and gemini_pending and overall_progress >= 1.0:
+            overall_progress = 0.99
         if notify: job["captcha_notified"] = True
     st.info(message)
     progress_percent = round(overall_progress * 100)
     st.progress(overall_progress, text=f"Tiến độ tổng thể: {progress_percent}% — hoàn tất {tasks_completed}/{task_total} nhóm thành phố × từ khóa")
-    checked_col, kept_col, rejected_col, retry_col = st.columns(4)
+    checked_col, kept_col, rejected_col, retry_col, cache_col = st.columns(5)
     checked_col.metric("Đã kiểm tra", checked_count)
     kept_col.metric("Giữ lại", kept_count)
     rejected_col.metric("Loại", rejected_count)
-    retry_col.metric("Chờ thử lại", retry_waiting)
+    retry_col.metric("Đang chờ", retry_waiting + gemini_pending)
+    cache_col.metric("Dùng cache", cache_hits)
     if notify:
         st.warning("CAPTCHA đang chặn Google. Hãy mở cửa sổ Chrome và xác minh thủ công để bot tiếp tục.")
         components.html("""<script>
@@ -1086,7 +1420,7 @@ def main() -> None:
     if source:
         with pd.ExcelFile(io.BytesIO(source)) as book:
             used_sheet_names.extend(book.sheet_names)
-    if run_manual and city.strip():
+    if run_manual:
         seen_manual_cities = set()
         for manual_city in (item.strip() for item in city.split(",") if item.strip()):
             city_key = manual_city.lower()
@@ -1104,7 +1438,7 @@ def main() -> None:
         return
     st.session_state["scrape_job"] = start_background_job({
         "source": source, "jobs": jobs, "keywords": [x.strip() for x in keywords.splitlines() if x.strip()],
-        "limit": int(limit), "parallel_workers": 1, "headless": False, "known": existing_lead_keys(source) if source else set(),
+        "limit": int(limit), "parallel_workers": 2, "headless": False, "known": existing_lead_keys(source) if source else set(),
         "gemini_api_key": gemini_api_key,
     })
     st.rerun()
