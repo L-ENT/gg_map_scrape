@@ -22,6 +22,7 @@ from app import (
     extract_operation_time_from_text,
     filter_result,
     format_elapsed_time,
+    merged_export_phones,
     lead_identity_keys,
     maps_place_id_from_url,
     merge_gemini_evidence,
@@ -204,6 +205,52 @@ def test_collective_phone_exception_does_not_bypass_other_rejection_rules():
 def test_direct_therapist_phone_is_propagated_to_filter_evidence():
     evidence = merge_gemini_evidence(Evidence(), {"status": "ok", "direct_therapist_phone": True})
     assert evidence.direct_therapist_phone is True
+
+
+def test_group_practice_structure_overrides_a_loose_collective_label():
+    evidence = merge_gemini_evidence(Evidence(), {
+        "status": "ok", "practice_structure": "group_practice",
+        "is_collective": True, "target_service": True,
+        "direct_booking_contacts": [],
+    })
+    verification = {"Contains_Target_Services_Licenses": True, **{
+        "is_therapist_collective_or_independent": evidence.is_collective,
+        "Has_Direct_Therapist_Phone": evidence.direct_therapist_phone,
+    }}
+    assert evidence.practice_structure == "group_practice"
+    assert evidence.is_collective is False
+    assert filter_result(verification) == "KEEP"
+
+
+def test_collective_requires_a_named_valid_direct_booking_contact():
+    shared_only = merge_gemini_evidence(Evidence(), {
+        "status": "ok", "practice_structure": "therapist_collective",
+        "collective_evidence": "Therapists run separate businesses under one umbrella.",
+        "direct_booking_contacts": [], "target_service": True,
+    })
+    direct = merge_gemini_evidence(Evidence(), {
+        "status": "ok", "practice_structure": "therapist_collective",
+        "collective_evidence": "Therapists independently accept their own clients.",
+        "direct_booking_contacts": [
+            {"therapist": "Jane Smith", "phone": "(801) 555-1212"},
+            {"therapist": "N/A", "phone": "801-555-9999"},
+        ], "target_service": True,
+    })
+    assert shared_only.direct_therapist_phone is False
+    assert direct.direct_therapist_phone is True
+    assert direct.direct_booking_contacts == [{"therapist": "Jane Smith", "phone": "+18015551212"}]
+
+
+def test_all_verified_phone_numbers_are_written_to_one_excel_cell():
+    row = {"phone number": "(801) 555-1000"}
+    metadata = {
+        "verified_phone_numbers": ["+1 801 555 1000", "385-555-2000", "invalid"],
+        "direct_booking_contacts": [
+            {"therapist": "Jane Smith", "phone": "801-555-3000"},
+            {"therapist": "John Doe", "phone": "385-555-2000"},
+        ],
+    }
+    assert merged_export_phones(row, metadata) == "+18015551000; +13855552000; +18015553000"
 
 
 def test_rejects_only_above_sixty_therapists_or_five_locations():

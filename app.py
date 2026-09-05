@@ -47,8 +47,8 @@ MAX_THERAPIST_COUNT, MAX_BRANCH_COUNT = 60, 5
 MIN_MAPS_SCROLL_ROUNDS, MAPS_STALL_ROUNDS = 20, 20
 MAX_SAVED_CHECKPOINTS = 10
 CACHE_TTL_DAYS = 30
-CACHE_PROMPT_VERSION = 1
-CACHE_RULE_VERSION = 1
+CACHE_PROMPT_VERSION = 2
+CACHE_RULE_VERSION = 2
 GEMINI_MIN_REQUEST_INTERVAL_SECONDS = 5.0
 GEMINI_MAX_RETRIES = 4
 AI_MODE_MAX_ATTEMPTS = 2
@@ -214,9 +214,59 @@ class Evidence:
     private_practice: Optional[bool] = None; disallowed_provider_title: bool = False
     red_flags: List[str] = field(default_factory=list); target_service: bool = False
     direct_therapist_phone: bool = False
+    practice_structure: str = "unknown"
+    collective_evidence: str = "N/A"
+    direct_booking_contacts: List[Dict[str, str]] = field(default_factory=list)
 
 def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+def canonical_us_phone(value: Any) -> str:
+    """Return one verified-looking US phone in the export's +1 format."""
+    digits = re.sub(r"\D", "", normalize_text(value))
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return f"+1{digits}" if len(digits) == 10 else ""
+
+def valid_direct_booking_contacts(value: Any) -> List[Dict[str, str]]:
+    """Keep only named therapist contacts with a valid, distinct phone value."""
+    if not isinstance(value, list):
+        return []
+    contacts: List[Dict[str, str]] = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        therapist = normalize_text(item.get("therapist", ""))
+        phone = canonical_us_phone(item.get("phone", ""))
+        if not therapist or therapist.upper() == "N/A" or not phone or phone in seen:
+            continue
+        seen.add(phone)
+        contacts.append({"therapist": therapist, "phone": phone})
+    return contacts
+
+def merged_export_phones(row: Dict[str, Any], metadata: Dict[str, Any]) -> str:
+    """Combine Maps and Gemini-verified clinic/therapist phones without duplicates."""
+    values: List[Any] = []
+    maps_phone = row.get("phone number", row.get("Phone Number", ""))
+    if isinstance(maps_phone, str):
+        values.extend(re.split(r"[;\n]+", maps_phone))
+    else:
+        values.append(maps_phone)
+    verified = metadata.get("verified_phone_numbers", [])
+    if isinstance(verified, list):
+        values.extend(verified)
+    values.extend(contact["phone"] for contact in valid_direct_booking_contacts(metadata.get("direct_booking_contacts")))
+    result: List[str] = []
+    seen = set()
+    for value in values:
+        phone = canonical_us_phone(value)
+        if phone and phone not in seen:
+            seen.add(phone)
+            result.append(phone)
+    if result:
+        return "; ".join(result)
+    return normalize_text(maps_phone) or "N/A"
 
 def format_elapsed_time(seconds: float) -> str:
     total = max(0, int(seconds))
@@ -451,7 +501,7 @@ def extract_maps_place_with_retry(driver: webdriver.Chrome, url: str, city: str,
 
 def _google_ai_overview_once(driver: webdriver.Chrome, name: str, city: str, state: str, status: Any, should_stop: Optional[Any] = None) -> str:
     """Use one focused AI Mode request to gather every lead-screening fact."""
-    query = f'"{name}" {city} {state} briefly list explicit owner/founder/CEO and role, hours, private/nonprofit/government status, exact therapist count, actual locations, services including IOP, addiction, medication management, case management, peer support, medical treatment, solo/collective, whether a named therapist has a direct personal phone, board, 25+ years, MD/DO/PMHNP'
+    query = f'"{name}" {city} {state} briefly list explicit owner/founder/CEO and role, hours, private/nonprofit/government status, exact therapist count, actual locations, all verified non-fax phone numbers, services including IOP, addiction, medication management, case management, peer support, medical treatment, and classify solo practice vs normal group practice vs therapist collective where therapists run independently; for a collective list each named therapist with a separate direct booking phone and distinguish those from one shared office/scheduling phone; also list board, 25+ years, MD/DO/PMHNP'
     driver.get(f"https://www.google.com/search?udm=50&q={quote_plus(query)}"); time.sleep(2.2); maybe_accept_google_consent(driver)
     if not wait_for_manual_captcha(driver, status, should_stop): return ""
     # `udm=50` is Google Search's AI Mode surface. Streaming answers can exceed
@@ -579,7 +629,7 @@ def gemini_retry_delay(response: Any, attempt: int) -> float:
 
 def gemini_metadata(api_key: str, row: Dict[str, Any], ai_overview: str, requested_fields: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """Strict JSON fact extraction from Maps/AI Overview, with no website crawl."""
-    fallback = {"owner": "N/A", "owner_role": "N/A", "operation_time_and_days": "N/A", "doctor_count": None, "branch_count": None, "is_solo": None, "is_collective": None, "direct_therapist_phone": None, "nonprofit": None, "private_practice": None, "target_service": None, "red_flags": [], "disallowed_provider_title": None, "outdated_or_insufficient": None, "over_25_years": None, "has_board": None, "status": "not_called"}
+    fallback = {"owner": "N/A", "owner_role": "N/A", "operation_time_and_days": "N/A", "doctor_count": None, "branch_count": None, "practice_structure": "unknown", "collective_evidence": "N/A", "direct_booking_contacts": [], "verified_phone_numbers": [], "is_solo": None, "is_collective": None, "direct_therapist_phone": None, "nonprofit": None, "private_practice": None, "target_service": None, "red_flags": [], "disallowed_provider_title": None, "outdated_or_insufficient": None, "over_25_years": None, "has_board": None, "status": "not_called"}
     if not api_key.strip(): return fallback
     maps_text = normalize_text(row.get("maps raw text", ""))
     ai_text = normalize_text(ai_overview or "Not shown")
@@ -589,7 +639,11 @@ def gemini_metadata(api_key: str, row: Dict[str, Any], ai_overview: str, request
     with _GEMINI_CACHE_LOCK:
         cached = _GEMINI_CACHE.get(cache_key)
     if cached is not None: return cached
-    prompt = """You extract verifiable facts for a US therapy/counseling clinic lead. Use ONLY the supplied Google Maps text and visible Google AI Mode response. Do not use website content, do not browse, and do not invent. Return one JSON object only with exactly these keys: owner (one explicit full personal name, otherwise 'N/A'), owner_role (the explicit role proving ownership: owner, co-owner, founder, co-founder, CEO, or chief executive officer; otherwise 'N/A'), operation_time_and_days (a concise schedule with days and valid AM/PM times only when explicitly stated, otherwise 'N/A'), doctor_count (exact current number of therapists/providers as an integer only when explicitly supported, otherwise null; never convert 'under 10', ranges, directory result counts, or estimates into an integer), branch_count (exact number of physical locations operated by this practice only when explicitly supported, otherwise null; do not count telehealth service areas, nearby cities, partner organizations, or places merely mentioned), is_solo (true/false/null), is_collective (true/false/null), direct_therapist_phone (true only when the evidence explicitly associates a distinct direct/personal phone number with a named therapist; a clinic reception, main office, call center, shared scheduling, or unlabeled Maps phone is false/null), nonprofit (true/false/null), private_practice (true/false/null), target_service (true/false/null only for individual/couples/family/teen therapy, anxiety, depression, trauma, ADHD, bipolar, OCD, DBT, CBT, EMDR, play, art, IFS or listed licenses), red_flags (array containing only actual, directly offered clinic services among intensive outpatient, substance abuse, addiction treatment, medical treatment, peer support, medication management, case management, psychiatric hospital), disallowed_provider_title (true only for an explicit MD, DO, or PMHNP provider; otherwise false/null), outdated_or_insufficient (true only when the evidence explicitly says permanently closed, website down/unavailable/outdated, otherwise false/null), over_25_years (true only for an explicit 25+ years of experience/serving claim, otherwise false/null), has_board (true only for an explicit board of directors, otherwise false/null). Owner accuracy is strict: owner and owner_role must refer to the same named person in an explicit ownership statement. Never infer ownership from clinical director, authorized official, therapist, contact person, domain registration, seniority, or phrases such as 'likely managed by'. For red_flags: include an item ONLY when this clinic directly provides it as a real program/service. Never include it when the evidence says it is not offered, is only a referral to another provider, is offered by a parent/partner/sister organization rather than this clinic, or merely mentions a client condition, a search question, a support group, academic support, or ordinary psychotherapy. In particular, do not treat behavior issues (for example pornography/gaming struggles) as substance abuse or addiction treatment unless a dedicated substance-use/addiction-treatment program is explicitly offered. Do not treat group/family therapy as peer support, or treatment planning as case management. For is_collective: return true when clinicians operate as independent businesses under a shared collective/umbrella, market themselves separately, receive clients independently, or use therapist-specific contact details. Return false for an ordinary group practice where clinicians are members of the same clinic, even if the clinic has a team, collaborative staff, or co-owners. For nonprofit: return false when the evidence explicitly says it is private, for-profit, or 'not a nonprofit/government agency'. State licensing, Medicaid/public insurance, court approval, government regulation, or a .gov citation do NOT make a private clinic government-owned. Return true only for an affirmative nonprofit, state-owned, government-owned, government-run, or government-funded claim.\n\n"""
+    prompt = """You extract verifiable facts for a US therapy/counseling clinic lead. Use ONLY the supplied Google Maps text and visible Google AI Mode response. Do not browse and do not invent. Return one JSON object only with exactly these keys: owner (one explicit full personal name, otherwise 'N/A'), owner_role (the explicit role proving ownership: owner, co-owner, founder, co-founder, CEO, or chief executive officer; otherwise 'N/A'), operation_time_and_days (a concise schedule with days and valid AM/PM times only when explicitly stated, otherwise 'N/A'), doctor_count (exact current number of therapists/providers as an integer only when explicitly supported, otherwise null), branch_count (exact number of physical locations operated by this practice only when explicitly supported, otherwise null), practice_structure (exactly one of 'solo_practice', 'group_practice', 'therapist_collective', or 'unknown'), collective_evidence (a concise explicit statement proving independent therapists/businesses under one umbrella, otherwise 'N/A'), direct_booking_contacts (an array of objects with exactly therapist and phone; include an item only when a named therapist has a distinct direct/personal phone explicitly usable to contact or book that therapist), verified_phone_numbers (an array of every non-fax US phone explicitly confirmed as belonging to this practice or one of its named therapists, formatted +1XXXXXXXXXX), is_solo (true/false/null), is_collective (true/false/null), direct_therapist_phone (true/false/null), nonprofit (true/false/null), private_practice (true/false/null), target_service (true/false/null only for individual/couples/family/teen therapy, anxiety, depression, trauma, ADHD, bipolar, OCD, DBT, CBT, EMDR, play, art, IFS or listed licenses), red_flags (array containing only actual, directly offered clinic services among intensive outpatient, substance abuse, addiction treatment, medical treatment, peer support, medication management, case management, psychiatric hospital), disallowed_provider_title (true only for an explicit MD, DO, or PMHNP provider; otherwise false/null), outdated_or_insufficient (true only when the evidence explicitly says permanently closed, website down/unavailable/outdated, otherwise false/null), over_25_years (true only for an explicit 25+ years of experience/serving claim, otherwise false/null), has_board (true only for an explicit board of directors, otherwise false/null).
+
+Structure rules are strict. Use therapist_collective only when evidence explicitly shows therapists operate independently under a shared umbrella, such as separate businesses, separate marketing/client intake, or therapist-specific booking contacts. A name containing 'collective', a team page, multiple clinicians, collaboration, co-owners, or a shared brand is NOT sufficient. Use group_practice when clinicians belong to the same clinic/brand and use shared ownership or scheduling. Use solo_practice for one practitioner. Otherwise use unknown. Set is_collective consistently with practice_structure. A collective is allowed when at least one valid direct_booking_contacts item exists; a shared reception/main-office/call-center/scheduling number or an unlabeled Maps phone is never a therapist-direct contact. Set direct_therapist_phone true exactly when direct_booking_contacts is non-empty.
+
+Owner accuracy is strict: owner and owner_role must refer to the same named person in an explicit ownership statement. Never infer ownership from clinical director, authorized official, therapist, contact person, domain registration, seniority, or phrases such as 'likely managed by'. Never convert 'under 10', ranges, directory result counts, or estimates into doctor_count. Do not count telehealth service areas, nearby cities, partner organizations, or places merely mentioned as branches. For red_flags, include an item only when this clinic directly provides it as a real program/service, not a referral, partner service, client condition, support group, academic support, or ordinary psychotherapy. Do not treat behavior issues as substance abuse/addiction treatment without an explicit program; do not treat group/family therapy as peer support or treatment planning as case management. For nonprofit, licensing, Medicaid/public insurance, regulation, court approval, or a .gov citation do not prove government ownership; require an affirmative nonprofit/government claim.\n\n"""
     if focus:
         prompt += "This is one final targeted extraction. Concentrate only on these previously missing fields: " + ", ".join(focus) + ". Keep every other field null, false, empty, or 'N/A' rather than reinterpreting it.\n\n"
     prompt += "EVIDENCE:\n" + evidence
@@ -616,6 +670,18 @@ def gemini_metadata(api_key: str, row: Dict[str, Any], ai_overview: str, request
         result["operation_time_and_days"] = normalize_text(result["operation_time_and_days"]) or "N/A"
         if result["operation_time_and_days"] != "N/A" and extract_operation_time_from_text(result["operation_time_and_days"]) == "N/A": result["operation_time_and_days"] = "N/A"
         result["red_flags"] = [str(x).lower() for x in result["red_flags"] if str(x).lower() in RED_FLAG_TERMS]
+        structure = normalize_text(result.get("practice_structure", "unknown")).lower()
+        result["practice_structure"] = structure if structure in {"solo_practice", "group_practice", "therapist_collective", "unknown"} else "unknown"
+        result["collective_evidence"] = normalize_text(result.get("collective_evidence", "N/A")) or "N/A"
+        if result["practice_structure"] == "therapist_collective" and result["collective_evidence"].upper() == "N/A":
+            result["practice_structure"] = "unknown"
+        result["direct_booking_contacts"] = valid_direct_booking_contacts(result.get("direct_booking_contacts"))
+        phones = result.get("verified_phone_numbers", [])
+        result["verified_phone_numbers"] = list(dict.fromkeys(filter(None, (canonical_us_phone(phone) for phone in phones)))) if isinstance(phones, list) else []
+        if result["practice_structure"] != "unknown":
+            result["is_solo"] = result["practice_structure"] == "solo_practice"
+            result["is_collective"] = result["practice_structure"] == "therapist_collective"
+        result["direct_therapist_phone"] = bool(result["direct_booking_contacts"])
         with _GEMINI_CACHE_LOCK:
             _GEMINI_CACHE[cache_key] = result
         return result
@@ -628,13 +694,28 @@ def merge_gemini_evidence(base: Evidence, metadata: Dict[str, Any]) -> Evidence:
     if metadata.get("owner") and metadata["owner"] != "N/A": base.owner = metadata["owner"]
     if isinstance(metadata.get("doctor_count"), int): base.doctor_count = metadata["doctor_count"]
     if isinstance(metadata.get("branch_count"), int): base.branch_count = metadata["branch_count"]
+    structure = normalize_text(metadata.get("practice_structure", "unknown")).lower()
+    collective_evidence = normalize_text(metadata.get("collective_evidence", "N/A")) or "N/A"
+    if structure == "therapist_collective" and collective_evidence.upper() == "N/A":
+        structure = "unknown"
+    if structure in {"solo_practice", "group_practice", "therapist_collective"}:
+        base.practice_structure = structure
+        base.is_solo = structure == "solo_practice"
+        base.is_collective = structure == "therapist_collective"
     for attr, key in (("is_solo", "is_solo"), ("is_collective", "is_collective"), ("nonprofit", "nonprofit")):
+        if attr in {"is_solo", "is_collective"} and base.practice_structure != "unknown":
+            continue
         if metadata.get(key) in (True, False): setattr(base, attr, metadata[key])
     for attr, key in (("old_or_insufficient", "outdated_or_insufficient"), ("over_25_years", "over_25_years"), ("has_board", "has_board"), ("disallowed_provider_title", "disallowed_provider_title")):
         if metadata.get(key) in (True, False): setattr(base, attr, metadata[key])
     for attr, key in (("private_practice", "private_practice"), ("target_service", "target_service")):
         if metadata.get(key) in (True, False): setattr(base, attr, metadata[key])
-    if metadata.get("direct_therapist_phone") in (True, False):
+    base.collective_evidence = collective_evidence
+    base.direct_booking_contacts = valid_direct_booking_contacts(metadata.get("direct_booking_contacts"))
+    if "direct_booking_contacts" in metadata:
+        base.direct_therapist_phone = bool(base.direct_booking_contacts)
+    elif metadata.get("direct_therapist_phone") in (True, False):
+        # Compatibility for uncached/test metadata created before schema v2.
         base.direct_therapist_phone = metadata["direct_therapist_phone"]
     base.red_flags = list(metadata.get("red_flags", []))
     return base
@@ -648,7 +729,14 @@ def important_missing_fields(metadata: Dict[str, Any], ai_evidence: str) -> List
         missing.extend(["owner", "owner_role"])
     if metadata.get("doctor_count") is None and re.search(r"\b\d+\s+(?:therapists?|counselors?|providers?|clinicians?)\b", text, re.I):
         missing.append("doctor_count")
-    return missing
+    structure = normalize_text(metadata.get("practice_structure", "unknown")).lower()
+    if structure == "therapist_collective" and normalize_text(metadata.get("collective_evidence", "N/A")).upper() == "N/A":
+        missing.extend(["practice_structure", "collective_evidence"])
+    if structure == "unknown" and re.search(r"\b(?:collective|independent therapists?|group practice|shared (?:office|space|umbrella))\b", text, re.I):
+        missing.extend(["practice_structure", "collective_evidence"])
+    if structure == "therapist_collective" and not valid_direct_booking_contacts(metadata.get("direct_booking_contacts")) and re.search(r"\b(?:phone|call|text|book|schedule|appointment)\b", text, re.I):
+        missing.extend(["direct_booking_contacts", "verified_phone_numbers"])
+    return list(dict.fromkeys(missing))
 
 def merge_targeted_metadata(primary: Dict[str, Any], targeted: Dict[str, Any], fields: Sequence[str]) -> Dict[str, Any]:
     result = dict(primary)
@@ -666,6 +754,7 @@ def candidate_result(row: Dict[str, Any], ai_mode_evidence: str, metadata: Dict[
     evidence = merge_gemini_evidence(Evidence(), metadata)
     verification = evidence_as_verification(evidence)
     output_row["Owner's name"] = evidence.owner
+    output_row["phone number"] = merged_export_phones(output_row, metadata)
     gemini_hours = metadata.get("operation_time_and_days", "N/A")
     if metadata.get("status") == "ok" and gemini_hours != "N/A":
         output_row["operation time and days"] = gemini_hours
@@ -676,7 +765,11 @@ def candidate_result(row: Dict[str, Any], ai_mode_evidence: str, metadata: Dict[
         "Therapists": str(evidence.doctor_count) if evidence.doctor_count is not None else "UNKNOWN",
         "Private practice": "YES" if evidence.private_practice is True else ("NO" if evidence.private_practice is False else "UNKNOWN"),
         "Target services": "YES" if evidence.target_service is True else ("NO" if evidence.target_service is False else "UNKNOWN"),
+        "Practice structure": evidence.practice_structure.replace("_", " ").title(),
+        "Collective evidence": evidence.collective_evidence,
         "Direct therapist phone": "YES" if evidence.direct_therapist_phone else "NO",
+        "Direct booking contacts": "; ".join(f"{item['therapist']}: {item['phone']}" for item in evidence.direct_booking_contacts) or "N/A",
+        "Phone numbers": output_row["phone number"],
         "AI Mode evidence": ai_mode_evidence, "Gemini": metadata.get("status"),
         "Reasons": "; ".join(evidence.red_flags) or "eligible / insufficient evidence", "_export_row": dict(output_row),
     }
