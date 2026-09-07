@@ -21,6 +21,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote_plus, unquote_plus, urlparse
 
 import pandas as pd
+import psutil
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -48,7 +49,8 @@ MIN_MAPS_SCROLL_ROUNDS, MAPS_STALL_ROUNDS = 20, 20
 MAX_SAVED_CHECKPOINTS = 10
 CACHE_TTL_DAYS = 30
 CACHE_PROMPT_VERSION = 2
-CACHE_RULE_VERSION = 2
+CACHE_RULE_VERSION = 3
+BROWSER_MEMORY_LIMIT_BYTES = 1536 * 1024 * 1024
 GEMINI_MIN_REQUEST_INTERVAL_SECONDS = 5.0
 GEMINI_MAX_RETRIES = 4
 AI_MODE_MAX_ATTEMPTS = 2
@@ -323,11 +325,9 @@ def filter_result(v: Dict[str, Any]) -> str:
     if isinstance(v.get("branch_count"), (int, float)) and v["branch_count"] > MAX_BRANCH_COUNT: reasons.append(f">{MAX_BRANCH_COUNT} locations")
     if reasons:
         return "REJECT: " + "; ".join(reasons)
-    has_qualifying_evidence = bool(
-        v.get("Contains_Target_Services_Licenses")
-        or v.get("Has_Multiple_Therapists")
-        or v.get("Owner's name", "N/A") != "N/A"
-    )
+    # Owner/team size completes a valid therapy lead; neither can turn an
+    # unrelated service such as physical therapy into a qualifying prospect.
+    has_qualifying_evidence = v.get("Contains_Target_Services_Licenses") is True
     return "KEEP" if has_qualifying_evidence else "REJECT: insufficient qualifying evidence"
 
 def evidence_as_verification(e: Evidence) -> Dict[str, Any]:
@@ -336,10 +336,59 @@ def evidence_as_verification(e: Evidence) -> Dict[str, Any]:
 def build_driver(headless: bool) -> webdriver.Chrome:
     options = Options()
     if headless: options.add_argument("--headless=new")
-    options.add_argument("--window-size=1920,1200"); options.add_argument("--disable-notifications"); options.add_argument("--disable-blink-features=AutomationControlled")
+    for argument in (
+        "--window-size=1920,1200", "--disable-notifications",
+        "--disable-blink-features=AutomationControlled", "--disable-extensions",
+        "--disable-sync", "--disable-translate", "--disable-background-networking",
+        "--disable-component-update", "--disable-domain-reliability",
+        "--metrics-recording-only", "--no-first-run", "--no-default-browser-check",
+    ):
+        options.add_argument(argument)
+    options.page_load_strategy = "eager"
+    options.add_experimental_option("prefs", {
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+        "profile.default_content_setting_values.notifications": 2,
+    })
     options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"]); options.add_experimental_option("useAutomationExtension", False)
     try: return webdriver.Chrome(options=options)
     except WebDriverException: return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+
+def browser_process_memory_bytes(driver: webdriver.Chrome) -> int:
+    """Measure only the ChromeDriver/Chrome process tree owned by this worker."""
+    service_process = getattr(getattr(driver, "service", None), "process", None)
+    pid = getattr(service_process, "pid", None)
+    if not pid:
+        return 0
+    try:
+        root = psutil.Process(pid)
+        processes = [root, *root.children(recursive=True)]
+    except (psutil.Error, OSError):
+        return 0
+    total = 0
+    for process in processes:
+        try:
+            total += process.memory_info().rss
+        except (psutil.Error, OSError):
+            continue
+    return total
+
+def release_browser_page_memory(driver: webdriver.Chrome) -> None:
+    """Discard the completed Google page without deleting login/CAPTCHA cookies."""
+    try:
+        driver.get("about:blank")
+    except Exception:
+        return
+    # Cache Storage and the rendered JS heap are safe to release. Keep cookies
+    # and the normal HTTP asset cache so the next Google page still loads fast.
+    for command, parameters in (
+        ("Storage.clearDataForOrigin", {"origin": "https://www.google.com", "storageTypes": "cache_storage"}),
+        ("Memory.forciblyPurgeJavaScriptMemory", {}),
+    ):
+        try:
+            driver.execute_cdp_cmd(command, parameters)
+        except Exception:
+            pass
 
 def body_text(driver: webdriver.Chrome) -> str:
     try: return normalize_text(driver.find_element(By.TAG_NAME, "body").text)
@@ -627,9 +676,41 @@ def gemini_retry_delay(response: Any, attempt: int) -> float:
     except (ValueError, AttributeError): pass
     return min(30.0, float(2 ** (attempt + 1)))
 
+def gemini_error_details(response: Any) -> Tuple[str, str]:
+    """Preserve Google's machine status and human message for troubleshooting."""
+    try:
+        error = response.json().get("error", {})
+        if isinstance(error, dict):
+            return normalize_text(error.get("status", "")), normalize_text(error.get("message", ""))
+    except (ValueError, AttributeError):
+        pass
+    return "", normalize_text(getattr(response, "text", ""))
+
+def gemini_failure_status(response: Any) -> Tuple[str, str]:
+    """Classify only key/quota failures as replaceable; retain other 4xx detail."""
+    if response is None:
+        return "HTTP no response", "Gemini did not return a response."
+    api_status, message = gemini_error_details(response)
+    message = message[:500]
+    combined = f"{api_status} {message}".casefold()
+    if response.status_code == 429 or "resource_exhausted" in combined:
+        return "rate_limited", message or "Gemini quota has been exhausted."
+    auth_markers = ("api key", "apikey", "authentication", "unauthenticated", "permission_denied", "permission denied", "reported as leaked")
+    if response.status_code in {401, 403} or any(marker in combined for marker in auth_markers):
+        return "invalid_api_key", message or "Gemini rejected this API key or its restrictions."
+    detail = message or api_status or "Unknown Gemini request error"
+    return f"HTTP {response.status_code}: {detail}", detail
+
+def gemini_response_format_is_unsupported(response: Any) -> bool:
+    if response is None or response.status_code != 400:
+        return False
+    api_status, message = gemini_error_details(response)
+    detail = f"{api_status} {message}".casefold()
+    return any(marker in detail for marker in ("responseformat", "response_format", "generationconfig.response", "unknown name", "unknown field"))
+
 def gemini_metadata(api_key: str, row: Dict[str, Any], ai_overview: str, requested_fields: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """Strict JSON fact extraction from Maps/AI Overview, with no website crawl."""
-    fallback = {"owner": "N/A", "owner_role": "N/A", "operation_time_and_days": "N/A", "doctor_count": None, "branch_count": None, "practice_structure": "unknown", "collective_evidence": "N/A", "direct_booking_contacts": [], "verified_phone_numbers": [], "is_solo": None, "is_collective": None, "direct_therapist_phone": None, "nonprofit": None, "private_practice": None, "target_service": None, "red_flags": [], "disallowed_provider_title": None, "outdated_or_insufficient": None, "over_25_years": None, "has_board": None, "status": "not_called"}
+    fallback = {"owner": "N/A", "owner_role": "N/A", "operation_time_and_days": "N/A", "doctor_count": None, "branch_count": None, "practice_structure": "unknown", "collective_evidence": "N/A", "direct_booking_contacts": [], "verified_phone_numbers": [], "is_solo": None, "is_collective": None, "direct_therapist_phone": None, "nonprofit": None, "private_practice": None, "target_service": None, "red_flags": [], "disallowed_provider_title": None, "outdated_or_insufficient": None, "over_25_years": None, "has_board": None, "status": "not_called", "error_message": ""}
     if not api_key.strip(): return fallback
     maps_text = normalize_text(row.get("maps raw text", ""))
     ai_text = normalize_text(ai_overview or "Not shown")
@@ -647,16 +728,27 @@ Owner accuracy is strict: owner and owner_role must refer to the same named pers
     if focus:
         prompt += "This is one final targeted extraction. Concentrate only on these previously missing fields: " + ", ".join(focus) + ". Keep every other field null, false, empty, or 'N/A' rather than reinterpreting it.\n\n"
     prompt += "EVIDENCE:\n" + evidence
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key.strip()}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"x-goog-api-key": api_key.strip(), "Content-Type": "application/json"}
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"responseFormat": {"text": {"mimeType": "application/json"}}},
+    }
     try:
         response = None
         for attempt in range(GEMINI_MAX_RETRIES):
             wait_for_gemini_slot()
-            response = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}, timeout=45)
+            response = requests.post(url, headers=headers, json=payload, timeout=45)
             if response.status_code != 429: break
             if attempt < GEMINI_MAX_RETRIES - 1: time.sleep(gemini_retry_delay(response, attempt))
+        # Some rollout combinations still expose GenerateContent without the
+        # new responseFormat field. The prompt already requires JSON, so one
+        # plain compatibility request is safer than losing the saved evidence.
+        if gemini_response_format_is_unsupported(response):
+            wait_for_gemini_slot()
+            response = requests.post(url, headers=headers, json={"contents": payload["contents"]}, timeout=45)
         if response is None or response.status_code != 200:
-            fallback["status"] = "rate_limited" if response is not None and response.status_code == 429 else f"HTTP {response.status_code if response is not None else 'no response'}"
+            fallback["status"], fallback["error_message"] = gemini_failure_status(response)
             return fallback
         raw = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
@@ -664,7 +756,7 @@ Owner accuracy is strict: owner and owner_role must refer to the same named pers
         if not isinstance(parsed, dict):
             fallback["status"] = "invalid JSON shape"
             return fallback
-        result = {**fallback, **{key: parsed.get(key, fallback[key]) for key in fallback if key != "status"}, "status": "ok"}
+        result = {**fallback, **{key: parsed.get(key, fallback[key]) for key in fallback if key not in {"status", "error_message"}}, "status": "ok", "error_message": ""}
         result["owner"] = clean_owner_name(str(result["owner"])) if owner_role_is_explicit(result.get("owner_role")) and result["owner"] else "N/A"
         if result["owner"] == "N/A": result["owner_role"] = "N/A"
         result["operation_time_and_days"] = normalize_text(result["operation_time_and_days"]) or "N/A"
@@ -1151,10 +1243,11 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
         "known_lock": threading.Lock(), "captcha_workers": {}, "progress_label": "nhóm tìm kiếm",
         "task_total": len(config["jobs"]) * len(config["keywords"]),
         "tasks_completed": 0, "task_progress": {}, "retry_waiting": 0, "gemini_pending": 0, "cache_hits": 0,
+        "browser_memory_mb": {}, "browser_restarts": {},
         "rows_by_sheet": {sheet: [] for _, _, sheet in config["jobs"]}, "debug": [], "candidates": {},
         "checkpoint_path": str(checkpoint_dir / f"clinic_leads_checkpoint_{uuid.uuid4().hex[:8]}.xlsx"),
         "checkpoint_bytes": b"", "captcha_active": False, "captcha_notified": False, "captcha_sound_played": False,
-        "gemini_key_required": False, "gemini_key_notified": False, "gemini_key_event": threading.Event(),
+        "gemini_key_required": False, "gemini_key_notified": False, "gemini_key_reason": "", "gemini_key_event": threading.Event(),
     }
     # A new workbook must not lose clinics that were already fully analyzed in
     # an earlier run. Restore current KEEP results for the requested cities, but
@@ -1190,7 +1283,6 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
         save_checkpoint_locked(job)
     def worker() -> None:
         search_tasks: Queue = Queue()
-        clinic_tasks: Queue = Queue()
         gemini_tasks: Queue = Queue()
         for city, state, sheet in job["jobs"]:
             for keyword in job["keywords"]:
@@ -1198,19 +1290,36 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
         # Keep both requested browsers available even when there is only one
         # city/keyword search group; after discovery they share its clinics.
         worker_count = min(max(1, int(job.get("parallel_workers", 1))), 5)
+        clinic_task_queues = [Queue() for _ in range(worker_count)]
+        clinic_assignment = {"next": 0}
+        clinic_assignment_lock = threading.Lock()
+        clinic_shutdown = threading.Event()
         discovery_done = threading.Event()
         discovery_state = {"remaining": worker_count}
         discovery_state_lock = threading.Lock()
         discovered_urls = set()
         discovered_urls_lock = threading.Lock()
 
+        def enqueue_clinic(item: Dict[str, Any], preferred_worker: Optional[int] = None) -> None:
+            """Split initial work evenly; retries stay near their current worker."""
+            with clinic_assignment_lock:
+                if preferred_worker is None:
+                    target = clinic_assignment["next"] % worker_count
+                    clinic_assignment["next"] += 1
+                else:
+                    target = preferred_worker % worker_count
+                clinic_task_queues[target].put(item)
+
+        def clinic_queue_size() -> int:
+            return sum(task_queue.qsize() for task_queue in clinic_task_queues)
+
         def finish_discovery() -> None:
             with job["lock"]:
                 job["tasks_completed"] = 0
                 job["task_progress"].clear()
-                job["task_total"] = max(1, clinic_tasks.qsize())
+                job["task_total"] = max(1, clinic_queue_size())
                 job["progress_label"] = "phòng khám"
-                job["message"] = f"Đã tìm thấy {clinic_tasks.qsize()} kết quả Maps; hai Chrome đang chia nhau từng phòng khám."
+                job["message"] = f"Đã tìm thấy {clinic_queue_size()} kết quả Maps; hai Chrome đã chia việc cân bằng và đang chạy song song."
             discovery_done.set()
 
         def mark_discovery_worker_done() -> None:
@@ -1257,14 +1366,17 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                 job["gemini_pending"] = max(0, job["gemini_pending"] - 1)
 
         def request_gemini_with_key_replacement(item: Dict[str, Any], overview: str, requested_fields: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-            """Pause only Gemini when a key reaches quota; Chrome may keep collecting."""
+            """Pause only Gemini when quota/key fails; Chrome may keep collecting."""
             while not job["stop_event"].is_set():
                 metadata = gemini_metadata(job["gemini_api_key"], item["row"], overview, requested_fields=requested_fields)
-                if metadata.get("status") != "rate_limited":
+                status = normalize_text(metadata.get("status", ""))
+                if status not in {"rate_limited", "invalid_api_key"}:
                     return metadata
                 with job["lock"]:
                     job["gemini_key_required"] = True
-                    job["message"] = "Gemini API key đã hết hạn mức. Hãy nhập key mới để tiếp tục; dữ liệu Chrome vẫn được lưu vào hàng đợi."
+                    reason = normalize_text(metadata.get("error_message", ""))
+                    job["gemini_key_reason"] = reason or ("Gemini API key đã hết hạn mức." if status == "rate_limited" else "Gemini đã từ chối API key hoặc quyền truy cập.")
+                    job["message"] = f"{job['gemini_key_reason']} Hãy nhập key mới để tiếp tục; dữ liệu Chrome vẫn được lưu vào hàng đợi."
                     job["gemini_key_event"].clear()
                 while not job["stop_event"].is_set():
                     if job["gemini_key_event"].wait(timeout=1):
@@ -1350,6 +1462,42 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                                 threading.Thread(target=lambda: winsound.MessageBeep(winsound.MB_ICONEXCLAMATION), daemon=True).start()
                         job["message"] = f"Chrome {worker_number}/{worker_count}: {message}"
 
+                def clean_and_recycle_browser_if_needed() -> None:
+                    """Release one completed page and recycle only this bloated worker."""
+                    nonlocal driver
+                    if not driver:
+                        return
+                    # Never navigate away from a verification challenge. In the
+                    # normal flow run_job is still waiting, but keep this guard
+                    # for unexpected Google UI transitions as well.
+                    try:
+                        captcha_visible = captcha_is_visible(driver)
+                    except Exception:
+                        captcha_visible = False
+                    if captcha_visible:
+                        memory_bytes = browser_process_memory_bytes(driver)
+                        with job["lock"]:
+                            job["browser_memory_mb"][worker_number] = round(memory_bytes / (1024 * 1024))
+                        return
+                    release_browser_page_memory(driver)
+                    time.sleep(0.15)
+                    memory_bytes = browser_process_memory_bytes(driver)
+                    with job["lock"]:
+                        job["browser_memory_mb"][worker_number] = round(memory_bytes / (1024 * 1024))
+                    if job["stop_event"].is_set() or memory_bytes <= BROWSER_MEMORY_LIMIT_BYTES:
+                        return
+                    progress(f"RAM đạt {memory_bytes / (1024 ** 3):.1f} GB; đang làm mới riêng Chrome này…")
+                    old_driver, driver = driver, None
+                    try:
+                        old_driver.quit()
+                    except Exception:
+                        pass
+                    driver = build_driver(job["headless"])
+                    with job["lock"]:
+                        job["browser_memory_mb"][worker_number] = round(browser_process_memory_bytes(driver) / (1024 * 1024))
+                        job["browser_restarts"][worker_number] = job["browser_restarts"].get(worker_number, 0) + 1
+                        job["message"] = f"Chrome {worker_number}/{worker_count} đã được làm mới; Chrome còn lại vẫn chạy bình thường."
+
                 # Phase 1: both Chrome windows discover Maps listings. Every
                 # unique listing is placed into one shared clinic queue.
                 while not job["stop_event"].is_set():
@@ -1362,7 +1510,7 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                                 if url in discovered_urls:
                                     continue
                                 discovered_urls.add(url)
-                            clinic_tasks.put({
+                            enqueue_clinic({
                                 "url": url, "name_hint": name_hint, "saved_row": None, "deferred_retry": False,
                                 "city": city, "state": state, "sheet": sheet, "keyword": keyword,
                             })
@@ -1380,12 +1528,27 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                 mark_discovery_worker_done()
                 discovery_marked = True
                 discovery_done.wait()
+                clean_and_recycle_browser_if_needed()
 
-                # Phase 2: process one clinic at a time from the common queue.
+                # Phase 2: process the evenly assigned queue, with work stealing
+                # when the other browser would otherwise remain idle.
                 while True:
-                    clinic_item = clinic_tasks.get()
-                    if clinic_item is None:
-                        clinic_tasks.task_done()
+                    source_queue: Optional[Queue] = None
+                    clinic_item = None
+                    # Prefer this worker's evenly assigned half. If it finishes
+                    # first, steal from the other half so neither Chrome idles.
+                    while source_queue is None and not clinic_shutdown.is_set():
+                        for offset in range(worker_count):
+                            candidate_queue = clinic_task_queues[(worker_number - 1 + offset) % worker_count]
+                            try:
+                                clinic_item = candidate_queue.get_nowait()
+                                source_queue = candidate_queue
+                                break
+                            except Empty:
+                                continue
+                        if source_queue is None:
+                            time.sleep(0.05)
+                    if source_queue is None:
                         break
                     city = clinic_item["city"]; state = clinic_item["state"]
                     sheet = clinic_item["sheet"]; keyword = clinic_item["keyword"]
@@ -1404,10 +1567,10 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                             with job["lock"]:
                                 job["retry_waiting"] = max(0, job["retry_waiting"] + delta)
                         def on_deferred_retry(url: str, name_hint: str, saved_row: Dict[str, Any]) -> None:
-                            clinic_tasks.put({
+                            enqueue_clinic({
                                 "url": url, "name_hint": name_hint, "saved_row": saved_row, "deferred_retry": True,
                                 "city": city, "state": state, "sheet": sheet, "keyword": keyword,
-                            })
+                            }, preferred_worker=worker_number - 1)
                             with job["lock"]:
                                 job["task_total"] += 1
                         run_job(
@@ -1429,7 +1592,8 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                         with job["lock"]:
                             job["tasks_completed"] += 1
                             job["task_progress"].pop(worker_number, None)
-                        clinic_tasks.task_done()
+                        source_queue.task_done()
+                    clean_and_recycle_browser_if_needed()
                     if job["stop_event"].is_set():
                         continue
             except Exception as exc:
@@ -1448,9 +1612,12 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
         workers = [threading.Thread(target=browser_worker, args=(number,), daemon=True, name=f"clinic-browser-{number}") for number in range(1, worker_count + 1)]
         for browser_thread in workers: browser_thread.start()
         discovery_done.wait()
-        clinic_tasks.join()
-        for _ in workers: clinic_tasks.put(None)
-        clinic_tasks.join()
+        # A deferred AI retry can be enqueued into a queue whose first join has
+        # already returned, so repeat until every queue is simultaneously idle.
+        while any(task_queue.unfinished_tasks for task_queue in clinic_task_queues):
+            for task_queue in clinic_task_queues:
+                task_queue.join()
+        clinic_shutdown.set()
         for browser_thread in workers: browser_thread.join()
         gemini_tasks.put(None)
         gemini_tasks.join()
@@ -1468,6 +1635,7 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
             with job["lock"]:
                 job["retry_waiting"] = 0
                 job["gemini_key_required"] = False
+                job["gemini_key_reason"] = ""
                 job["finished_at"] = time.monotonic()
                 job["running"] = False
     threading.Thread(target=worker, daemon=True, name="clinic-scraper").start()
@@ -1530,11 +1698,14 @@ def _render_background_job(job: Dict[str, Any]) -> None:
         retry_waiting = int(job.get("retry_waiting", 0))
         gemini_pending = int(job.get("gemini_pending", 0))
         cache_hits = int(job.get("cache_hits", 0))
+        browser_memory = dict(job.get("browser_memory_mb", {}))
+        browser_restarts = dict(job.get("browser_restarts", {}))
         progress_label = normalize_text(job.get("progress_label", "công việc"))
         started_at = float(job.get("started_at", time.monotonic()))
         finished_at = job.get("finished_at")
         elapsed = format_elapsed_time(float(finished_at or time.monotonic()) - started_at)
         gemini_key_required = bool(job.get("gemini_key_required"))
+        gemini_key_reason = normalize_text(job.get("gemini_key_reason", ""))
         notify_gemini_key = gemini_key_required and not job.get("gemini_key_notified", False)
         if running and gemini_pending and overall_progress >= 1.0:
             overall_progress = 0.99
@@ -1549,6 +1720,10 @@ def _render_background_job(job: Dict[str, Any]) -> None:
     rejected_col.metric("Loại", rejected_count)
     retry_col.metric("Đang chờ", retry_waiting + gemini_pending)
     cache_col.metric("Dùng cache", cache_hits)
+    if browser_memory:
+        memory_parts = [f"Chrome {worker}: {megabytes / 1024:.1f} GB" for worker, megabytes in sorted(browser_memory.items())]
+        total_restarts = sum(int(count) for count in browser_restarts.values())
+        st.caption(f"RAM hai Chrome của tool: {' · '.join(memory_parts)} · Đã tự làm mới {total_restarts} lần (ngưỡng 1,5 GB/Chrome).")
     if notify:
         st.warning("CAPTCHA đang chặn Google. Hãy mở cửa sổ Chrome và xác minh thủ công để bot tiếp tục.")
         components.html("""<script>
@@ -1558,7 +1733,7 @@ def _render_background_job(job: Dict[str, Any]) -> None:
             o.connect(g); g.connect(c.destination); o.frequency.value = 880; g.gain.value = 0.08; o.start(); setTimeout(() => { o.stop(); c.close(); }, 450);
           } catch (_) {} </script>""", height=0)
     if gemini_key_required:
-        st.warning("Gemini API key đã hết hạn mức. Hai Chrome vẫn tiếp tục thu thập; hãy nhập key khác để hàng đợi Gemini chạy tiếp.")
+        st.warning(f"{gemini_key_reason or 'Gemini API key không thể tiếp tục.'} Hai Chrome vẫn tiếp tục thu thập; hãy nhập key khác để hàng đợi Gemini chạy tiếp.")
         replacement_key = st.text_input("Gemini API key mới", type="password", key="replacement_gemini_api_key")
         if st.button("Dùng key mới và tiếp tục", type="primary", key="replace_gemini_key"):
             if not replacement_key.strip():
@@ -1568,13 +1743,14 @@ def _render_background_job(job: Dict[str, Any]) -> None:
                     job["gemini_api_key"] = replacement_key.strip()
                     job["gemini_key_required"] = False
                     job["gemini_key_notified"] = False
+                    job["gemini_key_reason"] = ""
                     job["message"] = "Đã nhận Gemini API key mới; đang tiếp tục xử lý hàng đợi."
                     job["gemini_key_event"].set()
                 st.rerun()
     if notify_gemini_key:
         components.html("""<script>
           try { if (Notification.permission === 'default') Notification.requestPermission();
-            if (Notification.permission === 'granted') new Notification('Clinic scraper', {body: 'Gemini API key đã hết hạn mức. Hãy nhập key mới để tiếp tục.'});
+            if (Notification.permission === 'granted') new Notification('Clinic scraper', {body: 'Gemini API key hoặc hạn mức cần được thay thế để tiếp tục.'});
             const c = new (window.AudioContext || window.webkitAudioContext)(); const o = c.createOscillator(); const g = c.createGain();
             o.connect(g); g.connect(c.destination); o.frequency.value = 660; g.gain.value = 0.08; o.start(); setTimeout(() => { o.stop(); c.close(); }, 650);
           } catch (_) {} </script>""", height=0)

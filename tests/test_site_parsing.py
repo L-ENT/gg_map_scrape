@@ -15,6 +15,7 @@ from app import (
     ai_mode_evidence_is_ready,
     apply_debug_keep_selection,
     append_rows_preserving_template,
+    browser_process_memory_bytes,
     candidate_id,
     candidate_result,
     existing_lead_keys,
@@ -22,12 +23,15 @@ from app import (
     extract_operation_time_from_text,
     filter_result,
     format_elapsed_time,
+    gemini_failure_status,
+    gemini_metadata,
     merged_export_phones,
     lead_identity_keys,
     maps_place_id_from_url,
     merge_gemini_evidence,
     owner_role_is_explicit,
     promote_updater_payload,
+    release_browser_page_memory,
     run_job,
     start_background_job,
     should_keep_in_final_output,
@@ -43,6 +47,48 @@ def test_extract_operation_time_from_relevant_sentence():
 def test_elapsed_time_uses_fixed_hour_minute_second_format():
     assert format_elapsed_time(0) == "00:00:00"
     assert format_elapsed_time(3661.9) == "01:01:01"
+
+
+def test_browser_memory_counts_only_the_owned_process_tree(monkeypatch):
+    class FakeProcess:
+        def __init__(self, pid, rss, children=()):
+            self.pid = pid
+            self._rss = rss
+            self._children = list(children)
+
+        def children(self, recursive=False):
+            assert recursive is True
+            return self._children
+
+        def memory_info(self):
+            return type("Memory", (), {"rss": self._rss})()
+
+    chrome_children = [FakeProcess(11, 300), FakeProcess(12, 500)]
+    root = FakeProcess(10, 100, chrome_children)
+    monkeypatch.setattr("app.psutil.Process", lambda pid: root if pid == 10 else None)
+    driver = type("Driver", (), {"service": type("Service", (), {"process": type("Process", (), {"pid": 10})()})()})()
+
+    assert browser_process_memory_bytes(driver) == 900
+
+
+def test_page_cleanup_keeps_cookies_and_clears_only_lightweight_state():
+    class FakeDriver:
+        def __init__(self):
+            self.urls = []
+            self.commands = []
+
+        def get(self, url):
+            self.urls.append(url)
+
+        def execute_cdp_cmd(self, command, parameters):
+            self.commands.append((command, parameters))
+
+    driver = FakeDriver()
+    release_browser_page_memory(driver)
+
+    assert driver.urls == ["about:blank"]
+    assert ("Memory.forciblyPurgeJavaScriptMemory", {}) in driver.commands
+    assert all("cookies" not in str(parameters) for _, parameters in driver.commands)
 
 
 def test_ai_mode_rejects_streaming_and_short_answers():
@@ -177,6 +223,83 @@ def test_keep_logic_and_debug_result_agree_without_qualifying_evidence():
     verification = {"Is_NonProfit_StateOwned": False, "Contains_Red_Flags": False, "Has_Multiple_Therapists": False, "Contains_Target_Services_Licenses": False, "Owner's name": "N/A"}
     assert should_keep_in_final_output(verification) is False
     assert filter_result(verification) == "REJECT: insufficient qualifying evidence"
+
+
+def test_owner_does_not_keep_a_non_target_service():
+    verification = {
+        "Owner's name": "Rick Lybbert",
+        "Has_Multiple_Therapists": True,
+        "Contains_Target_Services_Licenses": False,
+    }
+    assert filter_result(verification) == "REJECT: insufficient qualifying evidence"
+
+
+def test_gemini_uses_header_and_current_json_response_format(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": '{"target_service": true}' }]}}]}
+
+    def fake_post(url, **kwargs):
+        captured.update({"url": url, **kwargs})
+        return FakeResponse()
+
+    monkeypatch.setattr("app.wait_for_gemini_slot", lambda: None)
+    monkeypatch.setattr("app.requests.post", fake_post)
+    result = gemini_metadata("new-key", {"Practice name": "Header Test Clinic", "location": "Provo"}, "Complete evidence")
+
+    assert result["status"] == "ok"
+    assert "?key=" not in captured["url"]
+    assert captured["headers"]["x-goog-api-key"] == "new-key"
+    assert captured["json"]["generationConfig"]["responseFormat"]["text"]["mimeType"] == "application/json"
+
+
+def test_gemini_retries_without_response_format_for_older_rollout(monkeypatch):
+    requests_seen = []
+
+    class UnsupportedFormatResponse:
+        status_code = 400
+        headers = {}
+        text = ""
+
+        def json(self):
+            return {"error": {"status": "INVALID_ARGUMENT", "message": "Unknown name responseFormat at generationConfig."}}
+
+    class SuccessfulResponse:
+        status_code = 200
+        headers = {}
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": '{"target_service": true}'}]}}]}
+
+    def fake_post(url, **kwargs):
+        requests_seen.append(kwargs["json"])
+        return UnsupportedFormatResponse() if len(requests_seen) == 1 else SuccessfulResponse()
+
+    monkeypatch.setattr("app.wait_for_gemini_slot", lambda: None)
+    monkeypatch.setattr("app.requests.post", fake_post)
+    result = gemini_metadata("rollout-key", {"Practice name": "Fallback Clinic", "location": "Provo"}, "Complete evidence")
+
+    assert result["status"] == "ok"
+    assert "generationConfig" in requests_seen[0]
+    assert requests_seen[1].keys() == {"contents"}
+
+
+def test_gemini_preserves_invalid_key_error_message():
+    class FakeResponse:
+        status_code = 400
+        text = ""
+
+        def json(self):
+            return {"error": {"status": "INVALID_ARGUMENT", "message": "API key not valid. Please use another API key."}}
+
+    status, message = gemini_failure_status(FakeResponse())
+    assert status == "invalid_api_key"
+    assert message == "API key not valid. Please use another API key."
 
 
 def test_solo_is_rejected_only_when_25_plus_years():
