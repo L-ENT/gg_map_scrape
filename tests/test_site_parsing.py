@@ -493,7 +493,7 @@ def test_duplicate_with_current_cache_shows_old_data_instead_of_empty_skip(tmp_p
 
     assert debug["Keep"] is True
     assert debug["Owner"] == "Jane Doe"
-    assert debug["Therapists"] == 3
+    assert debug["Therapists"] == "3"
     assert debug["Filter result"] == "KEEP: duplicate lead — reused cached data"
 
 
