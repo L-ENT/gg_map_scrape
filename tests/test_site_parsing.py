@@ -16,6 +16,7 @@ from app import (
     apply_debug_keep_selection,
     append_rows_preserving_template,
     browser_process_memory_bytes,
+    cached_duplicate_debug_item,
     candidate_id,
     candidate_result,
     existing_lead_keys,
@@ -28,6 +29,7 @@ from app import (
     merged_export_phones,
     lead_identity_keys,
     maps_place_id_from_url,
+    maybe_accept_google_consent,
     merge_gemini_evidence,
     owner_role_is_explicit,
     promote_updater_payload,
@@ -37,6 +39,33 @@ from app import (
     should_keep_in_final_output,
     wait_for_manual_captcha,
 )
+
+
+def test_google_consent_prefers_german_reject_button(monkeypatch):
+    class FakeButton:
+        def __init__(self):
+            self.clicked = False
+
+        def is_displayed(self): return True
+        def is_enabled(self): return True
+        def click(self): self.clicked = True
+
+    button = FakeButton()
+
+    class FakeDriver:
+        def __init__(self):
+            self.queries = []
+
+        def find_elements(self, by, xpath):
+            self.queries.append(xpath)
+            return [button] if "Alle ablehnen" in xpath else []
+
+    driver = FakeDriver()
+    monkeypatch.setattr("app.time.sleep", lambda _: None)
+
+    assert maybe_accept_google_consent(driver) is True
+    assert button.clicked is True
+    assert not any("Accept all" in query or "Alle akzeptieren" in query for query in driver.queries)
 
 
 def test_extract_operation_time_from_relevant_sentence():
@@ -444,6 +473,58 @@ def test_sqlite_cache_persists_all_evidence_layers(tmp_path):
     assert restored["maps"]["maps raw text"] == "Maps evidence"
     assert restored["ai_evidence"] == "Complete AI Mode evidence"
     assert restored["gemini"]["owner"] == "Jane Doe"
+
+
+def test_duplicate_with_current_cache_shows_old_data_instead_of_empty_skip(tmp_path):
+    cache = ClinicCache(tmp_path / "clinic_cache.sqlite")
+    row = {
+        "Practice name": "Cached Duplicate Clinic", "maps place id": "ChIJDUPLICATE",
+        "phone number": "8015551212", "website link": "https://duplicate.example",
+        "location": "Provo", "operation time and days": "9:00 AM - 5:00 PM",
+        "maps raw text": "Therapy clinic",
+    }
+    metadata = {
+        "status": "ok", "owner": "Jane Doe", "owner_role": "Owner", "doctor_count": 3,
+        "branch_count": 1, "target_service": True, "private_practice": True, "red_flags": [],
+    }
+    cache.save(row, ai_evidence="Complete cached evidence", metadata=metadata)
+
+    debug = cached_duplicate_debug_item(cache, row, "Provo")
+
+    assert debug["Keep"] is True
+    assert debug["Owner"] == "Jane Doe"
+    assert debug["Therapists"] == 3
+    assert debug["Filter result"] == "KEEP: duplicate lead — reused cached data"
+
+
+def test_incomplete_uploaded_duplicate_resumes_missing_gemini_analysis(monkeypatch, tmp_path):
+    cache = ClinicCache(tmp_path / "clinic_cache.sqlite")
+    row = {
+        "Practice name": "Incomplete Clinic", "maps place id": "ChIJINCOMPLETE",
+        "phone number": "8015553333", "website link": "https://incomplete.example",
+        "location": "Provo", "operation time and days": "9:00 AM - 5:00 PM",
+        "maps raw text": "Counseling and family therapy",
+    }
+    cache.save(row, ai_evidence="Complete cached AI evidence", metadata={"status": "stopped"})
+    gemini_calls = []
+    monkeypatch.setattr("app.maps_search_urls", lambda *args, **kwargs: [("place", "Incomplete Clinic")])
+    monkeypatch.setattr("app.extract_maps_place_with_retry", lambda *args, **kwargs: dict(row))
+    monkeypatch.setattr("app.google_ai_overview", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("AI Mode must resume from cache")))
+    monkeypatch.setattr("app.gemini_metadata", lambda *args, **kwargs: gemini_calls.append(args[1]["Practice name"]) or {
+        "status": "ok", "owner": "Jamie Doe", "owner_role": "Owner", "doctor_count": 2,
+        "branch_count": 1, "target_service": True, "private_practice": True, "red_flags": [],
+    })
+    source_keys = lead_identity_keys(row)
+
+    accepted, debug = run_job(
+        object(), "Provo", "UT", "therapy", 10, set(source_keys), lambda message: None,
+        "api-key", cache=cache, source_known=source_keys,
+    )
+
+    assert gemini_calls == ["Incomplete Clinic"]
+    assert accepted == []
+    assert debug[0]["Keep"] is True
+    assert debug[0]["Owner"] == "Jamie Doe"
 
 
 def test_cache_does_not_mix_same_name_in_different_cities(tmp_path):

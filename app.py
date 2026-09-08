@@ -394,10 +394,31 @@ def body_text(driver: webdriver.Chrome) -> str:
     try: return normalize_text(driver.find_element(By.TAG_NAME, "body").text)
     except WebDriverException: return ""
 
-def maybe_accept_google_consent(driver: webdriver.Chrome) -> None:
-    for label in ("Accept all", "I agree", "Chấp nhận tất cả", "Đồng ý"):
-        try: driver.find_element(By.XPATH, f"//*[self::button or @role='button'][contains(., '{label}')]").click(); time.sleep(.5); return
-        except WebDriverException: pass
+def maybe_accept_google_consent(driver: webdriver.Chrome) -> bool:
+    """Dismiss Google's locale-specific cookie wall before reading page data."""
+    # Rejecting optional cookies is enough to continue and avoids creating more
+    # personalized state in the short-lived automation profiles. Acceptance is
+    # retained as a fallback because Google does not show Reject on every flow.
+    labels = (
+        "Reject all", "Từ chối tất cả", "Alle ablehnen", "Alles ablehnen",
+        "Accept all", "I agree", "Chấp nhận tất cả", "Đồng ý",
+        "Alle akzeptieren", "Alles akzeptieren", "Ich stimme zu",
+    )
+    for label in labels:
+        xpath = f"//*[self::button or @role='button'][contains(normalize-space(.), '{label}')]"
+        try:
+            for button in driver.find_elements(By.XPATH, xpath):
+                if not button.is_displayed() or not button.is_enabled():
+                    continue
+                try:
+                    button.click()
+                except WebDriverException:
+                    driver.execute_script("arguments[0].click();", button)
+                time.sleep(.8)
+                return True
+        except WebDriverException:
+            continue
+    return False
 
 def captcha_is_visible(driver: webdriver.Chrome) -> bool:
     """Detect an actual Google verification challenge; this never attempts to solve it."""
@@ -1001,8 +1022,33 @@ def new_workbook(rows_by_sheet: Dict[str, pd.DataFrame]) -> bytes:
         for sheet, rows in rows_by_sheet.items(): rows.to_excel(writer, sheet_name=sheet, index=False)
     return output.getvalue()
 
-def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit: int, known: set, progress: Any, gemini_api_key: str = "", on_debug: Optional[Any] = None, on_candidate_progress: Optional[Any] = None, on_retry_waiting: Optional[Any] = None, should_stop: Optional[Any] = None, known_lock: Optional[Any] = None, cache: Optional[ClinicCache] = None, on_ai_ready: Optional[Any] = None, place_work_items: Optional[List[Tuple[str, str, Optional[Dict[str, Any]], bool]]] = None, on_deferred_retry: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def cached_duplicate_debug_item(cache: Optional[ClinicCache], row: Dict[str, Any], city: str) -> Optional[Dict[str, Any]]:
+    """Show a duplicate's current cached facts without adding another Excel row."""
+    if cache is None:
+        return None
+    query = dict(row)
+    query.setdefault("location", city)
+    cached = cache.lookup(query)
+    if not cached or not cached.get("maps") or not cached.get("ai_evidence"):
+        return None
+    if (
+        cached.get("gemini_status") != "ok"
+        or cached.get("prompt_version") != CACHE_PROMPT_VERSION
+        or cached.get("rule_version") != CACHE_RULE_VERSION
+        or not cached.get("gemini")
+    ):
+        return None
+    cached_row = dict(cached["maps"])
+    cached_row["location"] = city
+    _, keep, debug_item = candidate_result(cached_row, cached["ai_evidence"], cached["gemini"])
+    verdict = "KEEP" if keep else "REJECT"
+    debug_item["Filter result"] = f"{verdict}: duplicate lead — reused cached data"
+    debug_item["Reasons"] = "Lead already exists in the uploaded/current results; cached Maps + AI Mode + Gemini data is shown without adding another Excel row."
+    return debug_item
+
+def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit: int, known: set, progress: Any, gemini_api_key: str = "", on_debug: Optional[Any] = None, on_candidate_progress: Optional[Any] = None, on_retry_waiting: Optional[Any] = None, should_stop: Optional[Any] = None, known_lock: Optional[Any] = None, cache: Optional[ClinicCache] = None, on_ai_ready: Optional[Any] = None, place_work_items: Optional[List[Tuple[str, str, Optional[Dict[str, Any]], bool]]] = None, on_deferred_retry: Optional[Any] = None, source_known: Optional[set] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     accepted: List[Dict[str, Any]] = []; debug: List[Dict[str, Any]] = []
+    source_identity_keys = source_known or set()
     def record_debug(item: Dict[str, Any]) -> None:
         debug.append(item)
         if on_debug: on_debug(dict(item))
@@ -1030,8 +1076,16 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                         with known_lock: hint_is_duplicate = bool(hint_keys & known)
                     else: hint_is_duplicate = bool(hint_keys & known)
                     if hint_is_duplicate:
-                        record_debug({"Practice": name_hint, "Keep": False, "Filter result": "SKIP: duplicate lead", "Owner": "N/A", "Operation Time": "N/A", "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "not called", "Gemini": "not called", "Reasons": "Matched an existing normalized practice name before AI Mode"})
-                        continue
+                        cached_debug = cached_duplicate_debug_item(cache, {"Practice name": name_hint, "location": city}, city)
+                        if cached_debug:
+                            record_debug(cached_debug)
+                            continue
+                        # A row from the uploaded workbook may still be missing
+                        # Gemini fields. Let it resume from cache instead of
+                        # treating the unfinished row as permanently complete.
+                        if not (hint_keys & source_identity_keys):
+                            record_debug({"Practice": name_hint, "Keep": False, "Filter result": "SKIP: duplicate lead", "Owner": "N/A", "Operation Time": "N/A", "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "not called", "Gemini": "not called", "Reasons": "Matched another clinic already reserved in this run"})
+                            continue
                 place_id = maps_place_id_from_url(url)
                 if cache and place_id:
                     cached = cache.lookup({"maps place id": place_id})
@@ -1057,8 +1111,13 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                 is_duplicate = bool(reserved_keys & known)
                 if not is_duplicate: known.update(reserved_keys)
             if is_duplicate:
-                record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": "SKIP: duplicate lead", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "not called", "Gemini": "not called", "Reasons": "Matched an existing place ID, practice name, address, direct phone, or official website domain"})
-                continue
+                cached_debug = cached_duplicate_debug_item(cache, row, city)
+                if cached_debug:
+                    record_debug(cached_debug)
+                    continue
+                if not (reserved_keys & source_identity_keys):
+                    record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": "SKIP: duplicate lead", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": "not called", "Gemini": "not called", "Reasons": "Matched another clinic already reserved in this run"})
+                    continue
             if cache:
                 if not maps_from_cache: cache.save(row)
                 cached = cache.lookup(row)
@@ -1108,7 +1167,7 @@ def run_job(driver: webdriver.Chrome, city: str, state: str, keyword: str, limit
                 record_debug({"Practice": row["Practice name"], "Keep": False, "Filter result": f"WAITING: {label}", "Owner": "N/A", "Operation Time": row["operation time and days"], "Therapists": "UNKNOWN", "Private practice": "UNKNOWN", "Target services": "UNKNOWN", "AI Mode evidence": ai_mode_evidence, "Gemini": status, "Reasons": "AI Mode evidence was saved; Gemini can resume from cache next run", "_export_row": dict(row)})
                 continue
             row, keep, debug_item = candidate_result(row, ai_mode_evidence, metadata)
-            if keep:
+            if keep and not (lead_identity_keys(row) & source_identity_keys):
                 accepted.append(row)
             record_debug(debug_item)
         except (TimeoutException, WebDriverException) as exc:
@@ -1248,6 +1307,7 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
         "checkpoint_path": str(checkpoint_dir / f"clinic_leads_checkpoint_{uuid.uuid4().hex[:8]}.xlsx"),
         "checkpoint_bytes": b"", "captcha_active": False, "captcha_notified": False, "captcha_sound_played": False,
         "gemini_key_required": False, "gemini_key_notified": False, "gemini_key_reason": "", "gemini_key_event": threading.Event(),
+        "source_known": set(config.get("known", set())),
     }
     # A new workbook must not lose clinics that were already fully analyzed in
     # an earlier run. Restore current KEEP results for the requested cities, but
@@ -1330,6 +1390,11 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
 
         def append_accepted(row: Dict[str, Any], sheet: str) -> None:
             with job["lock"]:
+                identity_keys = lead_identity_keys(row)
+                if identity_keys & set(job.get("source_known", set())):
+                    return
+                if any(identity_keys & lead_identity_keys(existing) for existing in job["rows_by_sheet"][sheet]):
+                    return
                 job["rows_by_sheet"][sheet].append(row)
                 save_checkpoint_locked(job)
                 job["message"] = f"Đã tự động lưu: {sum(len(x) for x in job['rows_by_sheet'].values())} lead mới."
@@ -1584,6 +1649,7 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                                 clinic_item["saved_row"], clinic_item["deferred_retry"],
                             )],
                             on_deferred_retry=on_deferred_retry,
+                            source_known=job["source_known"],
                         )
                     except Exception as exc:
                         with job["lock"]:
@@ -1670,8 +1736,10 @@ def apply_debug_keep_selection(job: Dict[str, Any], edited_debug: pd.DataFrame) 
                     stored_debug["Keep"] = selected
                     break
             rows = job["rows_by_sheet"][sheet]
-            present = any(candidate_id(sheet, row) == item_id for row in rows)
-            if selected and not present:
+            candidate_keys = lead_identity_keys(candidate)
+            present = any(candidate_id(sheet, row) == item_id or bool(candidate_keys & lead_identity_keys(row)) for row in rows)
+            already_in_source = bool(lead_identity_keys(candidate) & set(job.get("source_known", set())))
+            if selected and not present and not already_in_source:
                 rows.append(dict(candidate)); changed += 1
             elif not selected and present:
                 job["rows_by_sheet"][sheet] = [row for row in rows if candidate_id(sheet, row) != item_id]
