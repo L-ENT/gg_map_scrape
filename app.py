@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import random
 import sqlite3
 import subprocess
 import sys
@@ -354,6 +355,55 @@ def build_driver(headless: bool) -> webdriver.Chrome:
     try: return webdriver.Chrome(options=options)
     except WebDriverException: return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
 
+class PacedBrowser:
+    """Keep the worker's browser reference stable across one CAPTCHA restart."""
+
+    def __init__(self, headless: bool, stop_event: threading.Event, checkpoint: Any):
+        self.headless = headless
+        self.stop_event = stop_event
+        self.checkpoint = checkpoint
+        self.raw = build_driver(headless)
+        self.last_url = ""
+        self.captcha_restarts = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.raw, name)
+
+    def pause(self) -> None:
+        if self.stop_event.wait(random.uniform(3, 8)):
+            raise WebDriverException("Stopped by user")
+
+    def get(self, url: str) -> None:
+        if url != "about:blank":
+            self.pause()
+            self.last_url = url
+        self.raw.get(url)
+
+    def restart_after_captcha(self, status: Any) -> bool:
+        if self.stop_event.is_set():
+            return False
+        if self.captcha_restarts >= 1:
+            return True  # Leave subsequent challenges open for manual verification.
+        self.checkpoint()
+        self.captcha_restarts += 1
+        try:
+            self.raw.quit()
+        except WebDriverException:
+            pass
+        status("Đã lưu tiến độ và đóng Chrome do yêu cầu xác minh; chờ 60 giây trước khi mở lại…")
+        if self.stop_event.wait(60):
+            return False
+        self.raw = build_driver(self.headless)
+        self.get(self.last_url)
+        maybe_accept_google_consent(self)
+        return True
+
+
+def pause_before_click(driver: webdriver.Chrome) -> None:
+    if isinstance(driver, PacedBrowser):
+        driver.pause()
+
+
 def browser_process_memory_bytes(driver: webdriver.Chrome) -> int:
     """Measure only the ChromeDriver/Chrome process tree owned by this worker."""
     service_process = getattr(getattr(driver, "service", None), "process", None)
@@ -411,6 +461,7 @@ def maybe_accept_google_consent(driver: webdriver.Chrome) -> bool:
                 if not button.is_displayed() or not button.is_enabled():
                     continue
                 try:
+                    pause_before_click(driver)
                     button.click()
                 except WebDriverException:
                     driver.execute_script("arguments[0].click();", button)
@@ -432,8 +483,11 @@ def captcha_is_visible(driver: webdriver.Chrome) -> bool:
         return False
 
 def wait_for_manual_captcha(driver: webdriver.Chrome, status: Any, should_stop: Optional[Any] = None) -> bool:
-    """Wait for manual verification until it succeeds or the user stops the job."""
+    """Try one cooldown/restart per worker, then wait for manual verification."""
     if not captcha_is_visible(driver): return True
+    if isinstance(driver, PacedBrowser):
+        if not driver.restart_after_captcha(status):
+            return False
     while captcha_is_visible(driver):
         if should_stop and should_stop():
             status("Đã dừng trong khi chờ xác minh CAPTCHA.")
@@ -629,6 +683,7 @@ def expand_ai_mode_answer(driver: webdriver.Chrome, main: Any) -> None:
         for button in main.find_elements(By.XPATH, button_xpath):
             try:
                 if button.is_displayed() and button.is_enabled():
+                    pause_before_click(driver)
                     driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", button)
                     clicked = True
             except WebDriverException:
@@ -1513,10 +1568,15 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
             driver: Optional[webdriver.Chrome] = None
             discovery_marked = False
             try:
-                driver = build_driver(job["headless"])
+                def checkpoint_before_restart() -> None:
+                    with job["lock"]:
+                        save_checkpoint_locked(job)
+
+                driver = PacedBrowser(job["headless"], job["stop_event"], checkpoint_before_restart)
                 def progress(message: str) -> None:
                     with job["lock"]:
-                        is_captcha = "CAPTCHA" in message.upper()
+                        upper_message = message.upper()
+                        is_captcha = "CAPTCHA" in upper_message and not upper_message.startswith("ĐÃ XÁC MINH CAPTCHA")
                         job["captcha_workers"][worker_number] = is_captcha
                         job["captcha_active"] = any(job["captcha_workers"].values())
                         if not job["captcha_active"]:
@@ -1557,7 +1617,8 @@ def start_background_job(config: Dict[str, Any]) -> Dict[str, Any]:
                         old_driver.quit()
                     except Exception:
                         pass
-                    driver = build_driver(job["headless"])
+                    old_driver.raw = build_driver(job["headless"])
+                    driver = old_driver
                     with job["lock"]:
                         job["browser_memory_mb"][worker_number] = round(browser_process_memory_bytes(driver) / (1024 * 1024))
                         job["browser_restarts"][worker_number] = job["browser_restarts"].get(worker_number, 0) + 1
