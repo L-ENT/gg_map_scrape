@@ -43,6 +43,7 @@ except ImportError:
 
 st.set_page_config(page_title="Google Maps AI Overview clinic leads", page_icon="🗺️", layout="wide")
 MAX_THERAPIST_COUNT, MAX_BRANCH_COUNT = 60, 5
+CAPTCHA_AUTO_RESTART_LIMIT = 4  # The fifth CAPTCHA is left open for the user.
 # Always give the Maps result feed a meaningful chance to load.  After the
 # minimum number of scrolls, stop only if it has remained unchanged for this
 # many more passes (or Google explicitly says the list has ended).
@@ -356,7 +357,7 @@ def build_driver(headless: bool) -> webdriver.Chrome:
     except WebDriverException: return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
 
 class PacedBrowser:
-    """Keep the worker's browser reference stable across one CAPTCHA restart."""
+    """Keep the worker's browser reference stable across CAPTCHA restarts."""
 
     def __init__(self, headless: bool, stop_event: threading.Event, checkpoint: Any):
         self.headless = headless
@@ -382,15 +383,18 @@ class PacedBrowser:
     def restart_after_captcha(self, status: Any) -> bool:
         if self.stop_event.is_set():
             return False
-        if self.captcha_restarts >= 1:
-            return True  # Leave subsequent challenges open for manual verification.
+        if self.captcha_restarts >= CAPTCHA_AUTO_RESTART_LIMIT:
+            return True
         self.checkpoint()
         self.captcha_restarts += 1
         try:
             self.raw.quit()
         except WebDriverException:
             pass
-        status("Đã lưu tiến độ và đóng Chrome do yêu cầu xác minh; chờ 60 giây trước khi mở lại…")
+        status(
+            f"Đã lưu tiến độ và đóng Chrome sau CAPTCHA lần {self.captcha_restarts}/"
+            f"{CAPTCHA_AUTO_RESTART_LIMIT}; chờ 60 giây trước khi mở lại…"
+        )
         if self.stop_event.wait(60):
             return False
         self.raw = build_driver(self.headless)
@@ -483,16 +487,17 @@ def captcha_is_visible(driver: webdriver.Chrome) -> bool:
         return False
 
 def wait_for_manual_captcha(driver: webdriver.Chrome, status: Any, should_stop: Optional[Any] = None) -> bool:
-    """Try one cooldown/restart per worker, then wait for manual verification."""
+    """Restart for the first four challenges, then wait for manual verification."""
     if not captcha_is_visible(driver): return True
-    if isinstance(driver, PacedBrowser):
-        if not driver.restart_after_captcha(status):
-            return False
     while captcha_is_visible(driver):
         if should_stop and should_stop():
             status("Đã dừng trong khi chờ xác minh CAPTCHA.")
             return False
-        status("Google đang yêu cầu CAPTCHA — hãy xác minh trong cửa sổ Chrome. App sẽ chờ cho đến khi bạn hoàn tất.")
+        if isinstance(driver, PacedBrowser) and driver.captcha_restarts < CAPTCHA_AUTO_RESTART_LIMIT:
+            if not driver.restart_after_captcha(status):
+                return False
+            continue
+        status("Google đã yêu cầu CAPTCHA lần thứ 5 — hãy xác minh trong cửa sổ Chrome. App sẽ chờ cho đến khi bạn hoàn tất.")
         time.sleep(2)
     status("Đã xác minh CAPTCHA, tiếp tục quét…")
     return True
